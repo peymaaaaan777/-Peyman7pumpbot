@@ -1,17 +1,34 @@
-import os
-import telebot
+name: Telegram Bot
 
-TOKEN = os.environ["8906090956:AAFPRk1NIZWhtTMmKo_bfUgzsiYuFEd5L7M"]
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - Main
 
-bot = telebot.TeleBot(TOKEN)
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
 
-@bot.message_handler(commands=["start"])
-def start(message):
-    bot.reply_to(message, "سلام 👋 ربات روشنه 🚀")
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-@bot.message_handler(func=lambda message: True)
-def reply(message):
-    bot.reply_to(message, "پیامت رو گرفتم ✅")
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-print("Bot is running...")
-bot.infinity_polling()
+      - name: Install dependencies
+        run: |
+          pip install pyTelegramBotAPI
+
+      - name: Check files
+        run: |
+          pwd
+          ls -la
+
+      - name: Run bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+        run: python bot.py
