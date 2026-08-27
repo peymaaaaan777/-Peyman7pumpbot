@@ -2,4 +2,5 @@
   env:
     BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
     PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
+    LIVE_TRADING: "false"
   run: python bot.py
