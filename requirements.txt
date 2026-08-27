@@ -1,4 +1,4 @@
 pyTelegramBotAPI
 requests
-solana
+base58
 solders
