@@ -10,7 +10,7 @@ from telebot import types
 
 
 # ============================================================
-# SOLANA HUNTER BOT V2
+# 🦈 SOLANA HUNTER V3
 # PAPER TRADING ONLY
 # ============================================================
 
@@ -24,71 +24,57 @@ bot = telebot.TeleBot(
     parse_mode="HTML"
 )
 
+HTTP = requests.Session()
+HTTP.headers.update({
+    "User-Agent": "SolanaHunterV3/1.0"
+})
+
+DEX_API = "https://api.dexscreener.com"
+
+
 # ============================================================
 # CONFIG
 # ============================================================
 
-STARTING_BALANCE = 3.5015
+START_BALANCE = 3.5015
 
-SCAN_INTERVAL = 15
+SCAN_SECONDS = 15
 
 MAX_OPEN_TRADES = 2
 
-# فقط 10 درصد سرمایه در هر معامله
-POSITION_SIZE_PERCENT = 0.10
+RISK_PER_TRADE = 0.10
 
-# فیلترهای اجباری ورود
 MIN_SCORE = 75
 MIN_BUY_PRESSURE = 60.0
 MIN_LIQUIDITY = 25000.0
 MIN_M5_VOLUME = 10000.0
 
-# روند قیمت
 MIN_M5_CHANGE = -10.0
 MAX_M5_CHANGE = 20.0
 
-# خروج
 STOP_LOSS = 0.08
 TAKE_PROFIT = 0.15
 
-# Trailing
 TRAILING_START = 0.08
 TRAILING_DISTANCE = 0.05
 
-# بعد از Stop Loss
 COOLDOWN_SECONDS = 10 * 60
 
-# بعد از چند ضرر متوالی، ورود جدید متوقف می‌شود
 MAX_CONSECUTIVE_LOSSES = 3
-
-# مدت توقف بعد از ضررهای متوالی
 LOSS_PAUSE_SECONDS = 15 * 60
 
-DEX_API = "https://api.dexscreener.com"
-
-STATE_FILE = "bot_state_v2.json"
-
-
-# ============================================================
-# HTTP
-# ============================================================
-
-session = requests.Session()
-
-session.headers.update({
-    "User-Agent": "SolanaHunterBot/2.0"
-})
+STATE_FILE = "paper_state_v3.json"
 
 
 # ============================================================
 # STATE
 # ============================================================
 
-state_lock = threading.Lock()
+lock = threading.Lock()
 
 state = {
-    "balance": STARTING_BALANCE,
-    "starting_balance": STARTING_BALANCE,
+    "balance": START_BALANCE,
+    "starting_balance": START_BALANCE,
 
     "open_trades": [],
     "closed_trades": [],
@@ -96,10 +82,9 @@ state = {
     "wins": 0,
     "losses": 0,
 
-    "total_profit": 0.0,
+    "total_pnl": 0.0,
 
     "consecutive_losses": 0,
-
     "paused_until": 0,
 
     "cooldowns": {},
@@ -108,77 +93,53 @@ state = {
 
     "last_scan": None,
 
-    "bot_started": False,
-
     "chat_id": None,
-
     "dashboard_message_id": None
 }
 
 
 # ============================================================
-# UTILS
+# TIME / FORMAT
 # ============================================================
 
-def utc_now():
+def now_utc():
     return datetime.now(
         timezone.utc
-    ).strftime("%Y-%m-%d %H:%M:%S UTC")
+    ).strftime(
+        "%Y-%m-%d %H:%M:%S UTC"
+    )
 
 
-def safe_float(value, default=0.0):
-
+def f(value, default=0.0):
     try:
-        if value is None:
-            return default
-
         return float(value)
-
     except Exception:
         return default
 
 
 def money(value):
-
     return f"${value:.4f}"
 
 
-def is_paused():
-
-    return time.time() < state["paused_until"]
-
-
-def remaining_pause():
-
-    seconds = int(
-        max(
-            0,
-            state["paused_until"] - time.time()
-        )
-    )
-
-    return seconds
-
-
 # ============================================================
-# SAVE / LOAD
+# STATE SAVE / LOAD
 # ============================================================
 
 def save_state():
 
     try:
 
-        with state_lock:
+        with lock:
 
             with open(
                 STATE_FILE,
                 "w",
                 encoding="utf-8"
-            ) as file:
+            ) as fp:
 
                 json.dump(
                     state,
-                    file,
+                    fp,
                     indent=2,
                     ensure_ascii=False
                 )
@@ -193,12 +154,9 @@ def save_state():
 
 def load_state():
 
-    global state
-
     if not os.path.exists(
         STATE_FILE
     ):
-
         return
 
     try:
@@ -207,16 +165,14 @@ def load_state():
             STATE_FILE,
             "r",
             encoding="utf-8"
-        ) as file:
+        ) as fp:
 
-            loaded = json.load(file)
+            old = json.load(fp)
 
-        # نسخه جدید همیشه با سرمایه اولیه
-        # شروع می‌شود اگر فایل قبلی وجود نداشته باشد.
-        state.update(loaded)
+        state.update(old)
 
         print(
-            "State loaded."
+            "V3 state loaded."
         )
 
     except Exception as e:
@@ -228,65 +184,31 @@ def load_state():
 
 
 # ============================================================
-# RESET PAPER ACCOUNT
+# DEXSCREENER
 # ============================================================
 
-def reset_paper_account():
-
-    with state_lock:
-
-        state["balance"] = STARTING_BALANCE
-
-        state["starting_balance"] = STARTING_BALANCE
-
-        state["open_trades"] = []
-
-        state["closed_trades"] = []
-
-        state["wins"] = 0
-
-        state["losses"] = 0
-
-        state["total_profit"] = 0.0
-
-        state["consecutive_losses"] = 0
-
-        state["paused_until"] = 0
-
-        state["cooldowns"] = {}
-
-    save_state()
-
-
-# ============================================================
-# DEXSCREENER DISCOVERY
-# ============================================================
-
-def get_latest_tokens():
-
-    discovered = {}
+def latest_tokens():
 
     urls = [
-
         f"{DEX_API}/token-boosts/latest/v1",
-
         f"{DEX_API}/token-profiles/latest/v1"
-
     ]
+
+    found = {}
 
     for url in urls:
 
         try:
 
-            response = session.get(
+            r = HTTP.get(
                 url,
                 timeout=10
             )
 
-            if response.status_code != 200:
+            if r.status_code != 200:
                 continue
 
-            data = response.json()
+            data = r.json()
 
             if not isinstance(
                 data,
@@ -299,7 +221,6 @@ def get_latest_tokens():
                 if item.get(
                     "chainId"
                 ) != "solana":
-
                     continue
 
                 address = item.get(
@@ -307,24 +228,21 @@ def get_latest_tokens():
                 )
 
                 if address:
-
-                    discovered[
-                        address
-                    ] = item
+                    found[address] = item
 
         except Exception as e:
 
             print(
-                "DISCOVERY ERROR:",
+                "TOKEN DISCOVERY ERROR:",
                 e
             )
 
     return list(
-        discovered.values()
+        found.values()
     )
 
 
-def get_pairs(address):
+def token_pairs(address):
 
     try:
 
@@ -333,16 +251,15 @@ def get_pairs(address):
             f"{address}"
         )
 
-        response = session.get(
+        r = HTTP.get(
             url,
             timeout=10
         )
 
-        if response.status_code != 200:
-
+        if r.status_code != 200:
             return []
 
-        data = response.json()
+        data = r.json()
 
         pairs = data.get(
             "pairs",
@@ -350,9 +267,8 @@ def get_pairs(address):
         )
 
         return [
-            pair
-            for pair in pairs
-            if pair.get(
+            p for p in pairs
+            if p.get(
                 "chainId"
             ) == "solana"
         ]
@@ -368,10 +284,10 @@ def get_pairs(address):
 
 
 # ============================================================
-# ANALYSIS
+# ANALYZE
 # ============================================================
 
-def analyze_pair(pair):
+def analyze(pair):
 
     try:
 
@@ -389,18 +305,13 @@ def analyze_pair(pair):
             "UNKNOWN"
         )
 
-        name = base.get(
-            "name",
-            symbol
-        )
-
-        price = safe_float(
+        price = f(
             pair.get(
                 "priceUsd"
             )
         )
 
-        liquidity = safe_float(
+        liquidity = f(
             pair.get(
                 "liquidity",
                 {}
@@ -409,7 +320,7 @@ def analyze_pair(pair):
             )
         )
 
-        volume = safe_float(
+        volume = f(
             pair.get(
                 "volume",
                 {}
@@ -440,21 +351,16 @@ def analyze_pair(pair):
             ) or 0
         )
 
-        total_txns = (
-            buys + sells
-        )
+        total = buys + sells
 
-        buy_pressure = 0.0
+        buy_pressure = 0
 
-        if total_txns > 0:
-
+        if total:
             buy_pressure = (
-                buys
-                / total_txns
-                * 100
-            )
+                buys / total
+            ) * 100
 
-        m5_change = safe_float(
+        m5 = f(
             pair.get(
                 "priceChange",
                 {}
@@ -469,67 +375,49 @@ def analyze_pair(pair):
 
         score = 0
 
-        # Liquidity
         if liquidity >= 100000:
             score += 20
-
         elif liquidity >= 50000:
             score += 17
-
         elif liquidity >= 25000:
             score += 13
 
-        # Volume
         if volume >= 100000:
             score += 20
-
         elif volume >= 50000:
             score += 17
-
         elif volume >= 25000:
             score += 14
-
         elif volume >= 10000:
             score += 10
 
-        # Buy pressure
         if buy_pressure >= 75:
             score += 25
-
         elif buy_pressure >= 68:
             score += 21
-
         elif buy_pressure >= 60:
             score += 16
 
-        # Transaction activity
-        if total_txns >= 200:
+        if total >= 200:
             score += 15
-
-        elif total_txns >= 100:
+        elif total >= 100:
             score += 12
-
-        elif total_txns >= 50:
+        elif total >= 50:
             score += 9
-
-        elif total_txns >= 20:
+        elif total >= 20:
             score += 5
 
-        # Healthy momentum
-        if 1 <= m5_change <= 10:
+        if 1 <= m5 <= 10:
             score += 15
-
-        elif 0 <= m5_change < 1:
+        elif 0 <= m5 < 1:
             score += 9
-
-        elif 10 < m5_change <= 20:
+        elif 10 < m5 <= 20:
             score += 7
 
-        # Bad momentum penalty
-        if m5_change < -5:
+        if m5 < -5:
             score -= 20
 
-        if m5_change > 20:
+        if m5 > 20:
             score -= 10
 
         score = max(
@@ -541,42 +429,25 @@ def analyze_pair(pair):
         )
 
         return {
-
             "address": address,
-
             "symbol": symbol,
-
-            "name": name,
-
             "price": price,
-
             "liquidity": liquidity,
-
             "volume": volume,
-
             "buys": buys,
-
             "sells": sells,
-
             "buy_pressure": buy_pressure,
-
-            "m5_change": m5_change,
-
+            "m5": m5,
             "score": score,
-
             "pair_address": pair.get(
                 "pairAddress"
-            ),
-
-            "url": pair.get(
-                "url"
             )
         }
 
     except Exception as e:
 
         print(
-            "ANALYZE ERROR:",
+            "ANALYSIS ERROR:",
             e
         )
 
@@ -587,37 +458,37 @@ def analyze_pair(pair):
 # HARD ENTRY FILTER
 # ============================================================
 
-def passes_entry_filter(token):
+def entry_check(t):
 
-    if token["score"] < MIN_SCORE:
+    if t["score"] < MIN_SCORE:
         return False, "LOW SCORE"
 
     if (
-        token["buy_pressure"]
+        t["buy_pressure"]
         < MIN_BUY_PRESSURE
     ):
         return False, "LOW BUY PRESSURE"
 
     if (
-        token["liquidity"]
+        t["liquidity"]
         < MIN_LIQUIDITY
     ):
         return False, "LOW LIQUIDITY"
 
     if (
-        token["volume"]
+        t["volume"]
         < MIN_M5_VOLUME
     ):
         return False, "LOW VOLUME"
 
     if (
-        token["m5_change"]
+        t["m5"]
         < MIN_M5_CHANGE
     ):
-        return False, "BAD M5 TREND"
+        return False, "BAD M5"
 
     if (
-        token["m5_change"]
+        t["m5"]
         > MAX_M5_CHANGE
     ):
         return False, "PUMP TOO FAST"
@@ -629,52 +500,53 @@ def passes_entry_filter(token):
 # COOLDOWN
 # ============================================================
 
-def is_on_cooldown(address):
+def cooldown(address):
 
-    until = safe_float(
-        state["cooldowns"].get(
+    until = f(
+        state[
+            "cooldowns"
+        ].get(
             address,
             0
         )
     )
 
     if time.time() < until:
-
         return True
 
-    if address in state["cooldowns"]:
-
-        del state["cooldowns"][
-            address
-        ]
-
-        save_state()
+    state[
+        "cooldowns"
+    ].pop(
+        address,
+        None
+    )
 
     return False
 
 
 def set_cooldown(address):
 
-    state["cooldowns"][
-        address
-    ] = (
+    state[
+        "cooldowns"
+    ][address] = (
         time.time()
         + COOLDOWN_SECONDS
     )
 
 
 # ============================================================
-# OPEN TRADE SEARCH
+# OPEN TRADE
 # ============================================================
 
-def find_open_trade(address):
+def get_trade(address):
 
-    for trade in state["open_trades"]:
+    for trade in state[
+        "open_trades"
+    ]:
 
-        if (
-            trade["address"]
-            == address
-        ):
+        if trade[
+            "address"
+        ] == address:
 
             return trade
 
@@ -685,17 +557,23 @@ def find_open_trade(address):
 # EQUITY
 # ============================================================
 
-def calculate_equity():
+def equity():
 
-    equity = state["balance"]
+    total = f(
+        state["balance"]
+    )
 
-    for trade in state["open_trades"]:
+    for trade in state[
+        "open_trades"
+    ]:
 
-        entry = safe_float(
-            trade["entry_price"]
+        entry = f(
+            trade[
+                "entry_price"
+            ]
         )
 
-        current = safe_float(
+        current = f(
             trade.get(
                 "current_price",
                 entry
@@ -709,29 +587,22 @@ def calculate_equity():
             current - entry
         ) / entry
 
-        equity += (
-            trade["amount_usd"]
-            * (1 + change)
+        value = (
+            trade[
+                "position"
+            ] * (1 + change)
         )
 
-    return equity
+        total += value
+
+    return total
 
 
 # ============================================================
-# PAPER BUY
+# BUY
 # ============================================================
 
-def paper_buy(token):
-
-    if is_paused():
-
-        print(
-            "ENTRY PAUSED:",
-            remaining_pause(),
-            "seconds"
-        )
-
-        return False
+def paper_buy(t):
 
     if len(
         state["open_trades"]
@@ -739,50 +610,45 @@ def paper_buy(token):
 
         return False
 
-    if find_open_trade(
-        token["address"]
+    if get_trade(
+        t["address"]
     ):
-
         return False
 
-    if is_on_cooldown(
-        token["address"]
+    if cooldown(
+        t["address"]
     ):
+        return False
 
+    if time.time() < f(
+        state["paused_until"]
+    ):
         return False
 
     passed, reason = (
-        passes_entry_filter(
-            token
-        )
+        entry_check(t)
     )
 
     if not passed:
 
         print(
-            "FILTER:",
-            token["symbol"],
+            "REJECT:",
+            t["symbol"],
             reason
         )
 
         return False
 
-    balance = safe_float(
+    cash = f(
         state["balance"]
     )
 
-    position_size = (
-        balance
-        * POSITION_SIZE_PERCENT
+    position = (
+        cash * RISK_PER_TRADE
     )
 
-    if position_size < 0.01:
-
+    if position < 0.01:
         return False
-
-    if position_size > balance:
-
-        position_size = balance
 
     trade = {
 
@@ -793,103 +659,161 @@ def paper_buy(token):
             )
         ),
 
-        "address": token[
+        "address": t[
             "address"
         ],
 
-        "symbol": token[
+        "symbol": t[
             "symbol"
         ],
 
-        "entry_price": token[
+        "entry_price": t[
             "price"
         ],
 
-        "current_price": token[
+        "current_price": t[
             "price"
         ],
 
-        "amount_usd": position_size,
+        "highest_price": t[
+            "price"
+        ],
 
-        "entry_time": utc_now(),
+        "position": position,
 
-        "score": token[
+        "entry_time": now_utc(),
+
+        "entry_score": t[
             "score"
         ],
 
-        "highest_price": token[
-            "price"
+        "entry_m5": t[
+            "m5"
         ],
+
+        "entry_buy_pressure":
+            t["buy_pressure"],
+
+        "entry_liquidity":
+            t["liquidity"],
+
+        "entry_volume":
+            t["volume"],
 
         "status": "OPEN"
     }
 
-    state["balance"] -= (
-        position_size
-    )
+    state[
+        "balance"
+    ] -= position
 
-    state["open_trades"].append(
+    state[
+        "open_trades"
+    ].append(
         trade
     )
 
     save_state()
 
-    send_buy_message(
-        token,
-        position_size
-    )
-
-    print(
-        "PAPER BUY:",
-        token["symbol"],
-        position_size
+    notify_buy(
+        t,
+        position
     )
 
     return True
 
 
 # ============================================================
-# PAPER SELL
+# SELL
 # ============================================================
 
 def paper_sell(
     trade,
-    price,
-    reason
+    execution_price,
+    reason,
+    stop_price=None
 ):
 
-    entry = safe_float(
-        trade["entry_price"]
+    entry = f(
+        trade[
+            "entry_price"
+        ]
     )
 
-    current = safe_float(
-        price
+    market_price = f(
+        execution_price
     )
 
     if entry <= 0:
         return
 
+    # --------------------------------------------------------
+    # V3 STOP MODEL
+    #
+    # If stop is triggered, record BOTH:
+    #
+    # stop_price:
+    # expected stop
+    #
+    # market_price:
+    # observed market price
+    #
+    # execution_price:
+    # simulated execution
+    # --------------------------------------------------------
+
+    if reason == "STOP LOSS":
+
+        if stop_price is None:
+
+            stop_price = (
+                entry
+                * (1 - STOP_LOSS)
+            )
+
+        # Paper model:
+        # execution occurs at stop price,
+        # while actual market price is preserved
+        # for slippage measurement.
+        execution_price = f(
+            stop_price
+        )
+
+    else:
+
+        execution_price = f(
+            execution_price
+        )
+
     change = (
-        current - entry
+        execution_price - entry
     ) / entry
 
-    profit = (
-        trade["amount_usd"]
-        * change
+    pnl = (
+        trade[
+            "position"
+        ] * change
     )
 
     returned = (
-        trade["amount_usd"]
-        + profit
+        trade[
+            "position"
+        ] + pnl
     )
 
-    state["balance"] += returned
+    state[
+        "balance"
+    ] += returned
 
-    state["total_profit"] += profit
+    state[
+        "total_pnl"
+    ] += pnl
 
-    if profit >= 0:
+    if pnl >= 0:
 
-        state["wins"] += 1
+        state[
+            "wins"
+        ] += 1
 
         state[
             "consecutive_losses"
@@ -897,30 +821,72 @@ def paper_sell(
 
     else:
 
-        state["losses"] += 1
+        state[
+            "losses"
+        ] += 1
 
         state[
             "consecutive_losses"
         ] += 1
 
-        # Cooldown بعد از ضرر
         set_cooldown(
-            trade["address"]
+            trade[
+                "address"
+            ]
         )
 
-    trade["exit_price"] = current
+    # Slippage from expected stop
+    slippage_percent = 0.0
 
-    trade["exit_time"] = utc_now()
+    if (
+        stop_price is not None
+        and stop_price > 0
+    ):
 
-    trade["profit"] = profit
+        slippage_percent = (
+            (
+                market_price
+                - stop_price
+            )
+            / stop_price
+            * 100
+        )
 
-    trade["return_percent"] = (
-        change * 100
-    )
+    trade[
+        "exit_price"
+    ] = execution_price
 
-    trade["reason"] = reason
+    trade[
+        "market_price_at_exit"
+    ] = market_price
 
-    trade["status"] = "CLOSED"
+    trade[
+        "stop_price"
+    ] = stop_price
+
+    trade[
+        "slippage_percent"
+    ] = slippage_percent
+
+    trade[
+        "pnl"
+    ] = pnl
+
+    trade[
+        "return_percent"
+    ] = change * 100
+
+    trade[
+        "exit_reason"
+    ] = reason
+
+    trade[
+        "exit_time"
+    ] = now_utc()
+
+    trade[
+        "status"
+    ] = "CLOSED"
 
     if trade in state[
         "open_trades"
@@ -938,7 +904,7 @@ def paper_sell(
         trade
     )
 
-    # توقف پس از ضررهای متوالی
+    # Pause after consecutive losses
     if (
         state[
             "consecutive_losses"
@@ -953,37 +919,31 @@ def paper_sell(
             + LOSS_PAUSE_SECONDS
         )
 
-        print(
-            "ENTRY PAUSED AFTER "
-            "CONSECUTIVE LOSSES"
-        )
-
     save_state()
 
-    send_sell_message(
-        trade,
-        profit,
-        change * 100,
-        reason
+    notify_sell(
+        trade
     )
 
 
 # ============================================================
-# MANAGE OPEN TRADES
+# MANAGE TRADES
 # ============================================================
 
 def manage_trades():
 
-    trades = list(
-        state["open_trades"]
-    )
-
-    for trade in trades:
+    for trade in list(
+        state[
+            "open_trades"
+        ]
+    ):
 
         try:
 
-            pairs = get_pairs(
-                trade["address"]
+            pairs = token_pairs(
+                trade[
+                    "address"
+                ]
             )
 
             if not pairs:
@@ -991,7 +951,7 @@ def manage_trades():
 
             pairs.sort(
                 key=lambda p:
-                safe_float(
+                f(
                     p.get(
                         "liquidity",
                         {}
@@ -1002,16 +962,16 @@ def manage_trades():
                 reverse=True
             )
 
-            analysis = analyze_pair(
+            t = analyze(
                 pairs[0]
             )
 
-            if not analysis:
+            if not t:
                 continue
 
-            current = analysis[
-                "price"
-            ]
+            current = f(
+                t["price"]
+            )
 
             if current <= 0:
                 continue
@@ -1020,10 +980,12 @@ def manage_trades():
                 "current_price"
             ] = current
 
-            highest = safe_float(
+            highest = f(
                 trade.get(
                     "highest_price",
-                    trade["entry_price"]
+                    trade[
+                        "entry_price"
+                    ]
                 )
             )
 
@@ -1035,8 +997,10 @@ def manage_trades():
 
                 highest = current
 
-            entry = safe_float(
-                trade["entry_price"]
+            entry = f(
+                trade[
+                    "entry_price"
+                ]
             )
 
             change = (
@@ -1047,12 +1011,18 @@ def manage_trades():
             # STOP LOSS
             # ------------------------------------------------
 
-            if change <= -STOP_LOSS:
+            stop_price = (
+                entry
+                * (1 - STOP_LOSS)
+            )
+
+            if current <= stop_price:
 
                 paper_sell(
                     trade,
                     current,
-                    "STOP LOSS"
+                    "STOP LOSS",
+                    stop_price
                 )
 
                 continue
@@ -1061,7 +1031,12 @@ def manage_trades():
             # TAKE PROFIT
             # ------------------------------------------------
 
-            if change >= TAKE_PROFIT:
+            tp_price = (
+                entry
+                * (1 + TAKE_PROFIT)
+            )
+
+            if current >= tp_price:
 
                 paper_sell(
                     trade,
@@ -1077,14 +1052,15 @@ def manage_trades():
 
             if change >= TRAILING_START:
 
-                drawdown_from_high = (
-                    current - highest
-                ) / highest
+                trailing_price = (
+                    highest
+                    * (
+                        1
+                        - TRAILING_DISTANCE
+                    )
+                )
 
-                if (
-                    drawdown_from_high
-                    <= -TRAILING_DISTANCE
-                ):
+                if current <= trailing_price:
 
                     paper_sell(
                         trade,
@@ -1097,26 +1073,24 @@ def manage_trades():
         except Exception as e:
 
             print(
-                "TRADE MANAGER ERROR:",
+                "MANAGE ERROR:",
                 e
             )
 
 
 # ============================================================
-# MARKET SCANNER
+# SCAN
 # ============================================================
 
-def scan_market():
+def scan():
 
     results = []
 
-    raw_tokens = (
-        get_latest_tokens()
-    )
+    addresses = latest_tokens()
 
-    checked = set()
+    seen = set()
 
-    for item in raw_tokens[:50]:
+    for item in addresses[:50]:
 
         address = item.get(
             "tokenAddress"
@@ -1125,57 +1099,43 @@ def scan_market():
         if not address:
             continue
 
-        if address in checked:
+        if address in seen:
             continue
 
-        checked.add(address)
+        seen.add(address)
 
-        try:
+        pairs = token_pairs(
+            address
+        )
 
-            pairs = get_pairs(
-                address
-            )
+        if not pairs:
+            continue
 
-            if not pairs:
-                continue
+        pairs.sort(
+            key=lambda p:
+            f(
+                p.get(
+                    "liquidity",
+                    {}
+                ).get(
+                    "usd"
+                )
+            ),
+            reverse=True
+        )
 
-            pairs.sort(
-                key=lambda p:
-                safe_float(
-                    p.get(
-                        "liquidity",
-                        {}
-                    ).get(
-                        "usd"
-                    )
-                ),
-                reverse=True
-            )
+        t = analyze(
+            pairs[0]
+        )
 
-            token = analyze_pair(
-                pairs[0]
-            )
-
-            if not token:
-                continue
-
-            # TOP HUNTS می‌تواند اطلاعات
-            # بیشتری نشان دهد، اما برای خرید
-            # حتماً hard filter اجرا می‌شود.
+        if t:
             results.append(
-                token
+                t
             )
 
-            time.sleep(
-                0.10
-            )
-
-        except Exception as e:
-
-            print(
-                "SCAN TOKEN ERROR:",
-                e
-            )
+        time.sleep(
+            0.1
+        )
 
     results.sort(
         key=lambda x:
@@ -1183,15 +1143,13 @@ def scan_market():
         reverse=True
     )
 
-    results = results[:10]
-
     state[
         "top_hunts"
-    ] = results
+    ] = results[:10]
 
     state[
         "last_scan"
-    ] = utc_now()
+    ] = now_utc()
 
     save_state()
 
@@ -1199,79 +1157,62 @@ def scan_market():
 
 
 # ============================================================
-# TRADING LOOP
+# ENGINE
 # ============================================================
 
-def trading_loop():
+def engine():
 
     while True:
 
         try:
 
             print(
-                "\n=========================="
+                "\n=============================="
             )
 
             print(
-                "🦈 NEW MARKET CYCLE"
+                "🦈 SOLANA HUNTER V3"
             )
 
             print(
-                utc_now()
+                now_utc()
             )
 
+            # First manage existing trades
             manage_trades()
 
-            results = scan_market()
+            # Then scan
+            results = scan()
 
-            # اگر در حالت توقف هستیم
-            if is_paused():
+            # Don't enter while paused
+            if time.time() >= f(
+                state["paused_until"]
+            ):
 
-                print(
-                    "ENTRY PAUSED FOR:",
-                    remaining_pause(),
-                    "SECONDS"
-                )
+                # Only ONE new entry per cycle
+                for t in results:
 
-                update_dashboard()
-
-                time.sleep(
-                    SCAN_INTERVAL
-                )
-
-                continue
-
-            # فقط اولین سیگنال معتبر
-            # در هر چرخه
-            for token in results:
-
-                passed, reason = (
-                    passes_entry_filter(
-                        token
+                    passed, reason = (
+                        entry_check(t)
                     )
-                )
 
-                if not passed:
+                    if not passed:
+                        continue
 
-                    continue
-
-                if paper_buy(
-                    token
-                ):
-
-                    break
+                    if paper_buy(t):
+                        break
 
             update_dashboard()
 
         except Exception as e:
 
             print(
-                "TRADING LOOP ERROR:",
+                "ENGINE ERROR:",
                 e
             )
 
         time.sleep(
-            SCAN_INTERVAL
+            SCAN_SECONDS
         )
 
 
@@ -1287,7 +1228,6 @@ def win_rate():
     )
 
     if total == 0:
-
         return 0
 
     return (
@@ -1297,46 +1237,56 @@ def win_rate():
     )
 
 
-def drawdown_percent():
+def drawdown():
 
-    starting = safe_float(
-        state["starting_balance"]
+    start = f(
+        state[
+            "starting_balance"
+        ]
     )
 
-    equity = calculate_equity()
+    eq = equity()
 
-    if starting <= 0:
+    if start <= 0:
         return 0
 
     return (
         (
-            equity - starting
+            eq - start
         )
-        / starting
+        / start
         * 100
     )
 
 
-def dashboard_text():
+def dashboard():
 
-    equity = calculate_equity()
+    eq = equity()
 
     pnl = (
-        equity
-        - state["starting_balance"]
+        eq
+        - state[
+            "starting_balance"
+        ]
     )
 
-    pause_text = "🟢 READY"
+    if time.time() < f(
+        state[
+            "paused_until"
+        ]
+    ):
 
-    if is_paused():
-
-        pause_text = (
+        protection = (
             "🟡 PAUSED "
-            f"({remaining_pause()}s)"
+            f"({int(state['paused_until'] - time.time())}s)"
         )
 
+    else:
+
+        protection = "🟢 READY"
+
     return f"""
-<b>🦈 SOLANA HUNTER V2</b>
+<b>🦈 SOLANA HUNTER V3</b>
 
 ━━━━━━━━━━━━━━━━━━━━
 
@@ -1350,20 +1300,20 @@ def dashboard_text():
 <b>{money(state["balance"])}</b>
 
 📊 Equity:
-<b>{money(equity)}</b>
+<b>{money(eq)}</b>
 
 💰 Total PnL:
 <b>{money(pnl)}</b>
 
 📉 Drawdown:
-<b>{drawdown_percent():+.2f}%</b>
+<b>{drawdown():+.2f}%</b>
 
 ━━━━━━━━━━━━━━━━━━━━
 
-📂 Open Trades:
+📂 Open:
 <b>{len(state["open_trades"])}/{MAX_OPEN_TRADES}</b>
 
-🔢 Closed Trades:
+🔢 Closed:
 <b>{len(state["closed_trades"])}</b>
 
 ✅ Wins:
@@ -1381,18 +1331,18 @@ def dashboard_text():
 ━━━━━━━━━━━━━━━━━━━━
 
 ⭐ Min Score:
-<b>{MIN_SCORE}/100</b>
+<b>{MIN_SCORE}</b>
 
-🟢 Min Buy Pressure:
-<b>{MIN_BUY_PRESSURE:.0f}%</b>
+🟢 Buy Pressure:
+<b>{MIN_BUY_PRESSURE:.0f}%+</b>
 
-💧 Min Liquidity:
-<b>${MIN_LIQUIDITY:,.0f}</b>
+💧 Liquidity:
+<b>${MIN_LIQUIDITY:,.0f}+</b>
 
-📊 Min M5 Volume:
-<b>${MIN_M5_VOLUME:,.0f}</b>
+📊 M5 Volume:
+<b>${MIN_M5_VOLUME:,.0f}+</b>
 
-📈 Allowed M5:
+📈 M5:
 <b>{MIN_M5_CHANGE:.0f}% تا +{MAX_M5_CHANGE:.0f}%</b>
 
 ━━━━━━━━━━━━━━━━━━━━
@@ -1404,37 +1354,40 @@ def dashboard_text():
 <b>-{STOP_LOSS * 100:.0f}%</b>
 
 📈 Trailing:
-<b>{TRAILING_DISTANCE * 100:.0f}%</b>
+<b>+{TRAILING_START * 100:.0f}% / -{TRAILING_DISTANCE * 100:.0f}%</b>
 
 ⏱️ Scan:
-<b>{SCAN_INTERVAL}s</b>
+<b>{SCAN_SECONDS}s</b>
 
-🛡️ Risk/Trade:
-<b>{POSITION_SIZE_PERCENT * 100:.0f}%</b>
+🛡️ Position:
+<b>{RISK_PER_TRADE * 100:.0f}%</b>
 
 ━━━━━━━━━━━━━━━━━━━━
 
-🚦 Entry Protection:
-<b>{pause_text}</b>
+🚦 Protection:
+<b>{protection}</b>
 
 🕐 Last Scan:
-
-{state["last_scan"] or "Not yet"}
+{state["last_scan"] or "-"}
 
 ━━━━━━━━━━━━━━━━━━━━
 """
 
 
-def dashboard_keyboard():
+# ============================================================
+# TELEGRAM DASHBOARD
+# ============================================================
 
-    keyboard = types.InlineKeyboardMarkup(
+def keyboard():
+
+    k = types.InlineKeyboardMarkup(
         row_width=2
     )
 
-    keyboard.add(
+    k.add(
 
         types.InlineKeyboardButton(
-            "🦈 TOP HUNTS",
+            "🦈 TOP",
             callback_data="top"
         ),
 
@@ -1445,7 +1398,7 @@ def dashboard_keyboard():
 
     )
 
-    keyboard.add(
+    k.add(
 
         types.InlineKeyboardButton(
             "📜 HISTORY",
@@ -1459,7 +1412,7 @@ def dashboard_keyboard():
 
     )
 
-    return keyboard
+    return k
 
 
 def update_dashboard():
@@ -1473,73 +1426,205 @@ def update_dashboard():
     )
 
     if not chat_id or not message_id:
-
         return
 
     try:
 
         bot.edit_message_text(
-            dashboard_text(),
+            dashboard(),
             chat_id,
             message_id,
-            reply_markup=dashboard_keyboard()
+            reply_markup=keyboard()
         )
 
     except Exception as e:
 
         print(
-            "DASHBOARD ERROR:",
+            "DASHBOARD UPDATE:",
             e
         )
 
 
+def send_dashboard(chat_id):
+
+    state[
+        "chat_id"
+    ] = chat_id
+
+    msg = bot.send_message(
+        chat_id,
+        dashboard(),
+        reply_markup=keyboard()
+    )
+
+    state[
+        "dashboard_message_id"
+    ] = msg.message_id
+
+    save_state()
+
+
 # ============================================================
-# TELEGRAM
+# BUY NOTIFICATION
+# ============================================================
+
+def notify_buy(
+    t,
+    position
+):
+
+    chat_id = state.get(
+        "chat_id"
+    )
+
+    if not chat_id:
+        return
+
+    bot.send_message(
+        chat_id,
+        f"""
+<b>🚨 PAPER BUY V3</b>
+
+🪙 <b>{t["symbol"]}</b>
+
+⭐ Score:
+<b>{t["score"]}/100</b>
+
+💵 Price:
+${t["price"]:.10f}
+
+💧 Liquidity:
+${t["liquidity"]:,.0f}
+
+📊 M5 Volume:
+${t["volume"]:,.2f}
+
+🟢 Buy Pressure:
+{t["buy_pressure"]:.1f}%
+
+📈 M5:
+{t["m5"]:+.2f}%
+
+💰 Position:
+${position:.4f}
+
+🛡️ Risk:
+{RISK_PER_TRADE * 100:.0f}%
+
+🕐 {now_utc()}
+"""
+    )
+
+
+# ============================================================
+# SELL NOTIFICATION
+# ============================================================
+
+def notify_sell(trade):
+
+    chat_id = state.get(
+        "chat_id"
+    )
+
+    if not chat_id:
+        return
+
+    pnl = f(
+        trade[
+            "pnl"
+        ]
+    )
+
+    pct = f(
+        trade[
+            "return_percent"
+        ]
+    )
+
+    if pnl >= 0:
+        emoji = "🟢"
+    else:
+        emoji = "🔴"
+
+    extra = ""
+
+    if (
+        trade[
+            "exit_reason"
+        ]
+        == "STOP LOSS"
+    ):
+
+        extra = f"""
+🛑 Stop Price:
+${trade["stop_price"]:.10f}
+
+📍 Market Price:
+${trade["market_price_at_exit"]:.10f}
+
+📐 Slippage:
+{trade["slippage_percent"]:+.2f}%
+"""
+
+    bot.send_message(
+        chat_id,
+        f"""
+<b>{emoji} PAPER SELL V3</b>
+
+🪙 <b>{trade["symbol"]}</b>
+
+💰 PnL:
+<b>{pnl:+.4f} USD</b>
+
+📊 Return:
+<b>{pct:+.2f}%</b>
+
+🎯 Reason:
+<b>{trade["exit_reason"]}</b>
+
+💵 Cash:
+<b>{state["balance"]:.4f}</b>
+
+📊 Equity:
+<b>{equity():.4f}</b>
+{extra}
+🕐 {now_utc()}
+"""
+    )
+
+
+# ============================================================
+# TELEGRAM COMMANDS
 # ============================================================
 
 @bot.message_handler(
     commands=["start"]
 )
-def start_command(message):
+def start(message):
 
-    state["chat_id"] = (
-        message.chat.id
-    )
-
-    state["bot_started"] = True
+    state[
+        "chat_id"
+    ] = message.chat.id
 
     save_state()
 
     bot.send_message(
         message.chat.id,
         """
-<b>🦈 SOLANA HUNTER V2</b>
+<b>🦈 SOLANA HUNTER V3</b>
 
-ربات با موفقیت آنلاین شد. 🤖
+ربات با موفقیت متصل شد. 🤖
 
-🧪 Paper Trading فعال است.
+🧪 حالت:
+<b>PAPER TRADING</b>
 
-💰 هیچ معامله واقعی انجام نمی‌شود.
+هیچ معامله واقعی انجام نمی‌شود.
 
-برای داشبورد:
-
-/dashboard
-
-برای شکارهای برتر:
-
-/top
-
-برای معاملات باز:
-
-/open
-
-برای تاریخچه:
-
-/history
-
-برای وضعیت:
-
-/status
+📊 /dashboard
+🦈 /top
+📂 /open
+📜 /history
+📈 /status
 """
     )
 
@@ -1553,11 +1638,9 @@ def start_command(message):
 )
 def dashboard_command(message):
 
-    state["chat_id"] = (
-        message.chat.id
-    )
-
-    state["bot_started"] = True
+    state[
+        "chat_id"
+    ] = message.chat.id
 
     save_state()
 
@@ -1566,69 +1649,21 @@ def dashboard_command(message):
     )
 
 
-def send_dashboard(chat_id):
-
-    state["chat_id"] = chat_id
-
-    sent = bot.send_message(
-        chat_id,
-        dashboard_text(),
-        reply_markup=dashboard_keyboard()
-    )
-
-    state[
-        "dashboard_message_id"
-    ] = sent.message_id
-
-    save_state()
-
-
 @bot.message_handler(
     commands=["status"]
 )
-def status_command(message):
+def status(message):
 
     bot.send_message(
         message.chat.id,
-        dashboard_text()
+        dashboard()
     )
 
 
 @bot.message_handler(
     commands=["top"]
 )
-def top_command(message):
-
-    send_top(
-        message.chat.id
-    )
-
-
-@bot.message_handler(
-    commands=["open"]
-)
-def open_command(message):
-
-    send_open(
-        message.chat.id
-    )
-
-
-@bot.message_handler(
-    commands=["history"]
-)
-def history_command(message):
-
-    send_history(
-        message.chat.id
-    )
-
-
-# ============================================================
-# TOP HUNTS
-# ============================================================
-
-def send_top(chat_id):
+def top(message):
 
     hunts = state[
         "top_hunts"
@@ -1637,77 +1672,54 @@ def send_top(chat_id):
     if not hunts:
 
         bot.send_message(
-            chat_id,
-            "🔎 هنوز داده‌ای نداریم."
+            message.chat.id,
+            "🔎 هنوز داده‌ای ثبت نشده."
         )
 
         return
 
-    text = (
-        "<b>🦈 TOP HUNTS</b>\n\n"
-    )
+    text = "<b>🦈 TOP HUNTS V3</b>\n\n"
 
-    for index, token in enumerate(
+    for i, t in enumerate(
         hunts[:10],
         1
     ):
 
         passed, reason = (
-            passes_entry_filter(
-                token
-            )
+            entry_check(t)
         )
 
         signal = (
-            "🟢 BUY CANDIDATE"
+            "🟢 VALID"
             if passed
             else f"⚪ {reason}"
         )
 
         text += f"""
-<b>#{index} 🪙 {token["symbol"]}</b>
+<b>#{i} 🪙 {t["symbol"]}</b>
 
-⭐ Score: <b>{token["score"]}/100</b>
+⭐ Score: {t["score"]}/100
+💵 Price: ${t["price"]:.10f}
+💧 Liquidity: ${t["liquidity"]:,.0f}
+📊 M5 Volume: ${t["volume"]:,.2f}
+🟢 Buy Pressure: {t["buy_pressure"]:.1f}%
+📈 M5: {t["m5"]:+.2f}%
 
-💵 Price:
-${token["price"]:.10f}
-
-💧 Liquidity:
-${token["liquidity"]:,.0f}
-
-📊 M5 Volume:
-${token["volume"]:,.2f}
-
-🛒 Buys:
-{token["buys"]}
-
-📉 Sells:
-{token["sells"]}
-
-🟢 Buy Pressure:
-{token["buy_pressure"]:.1f}%
-
-📈 M5:
-{token["m5_change"]:+.2f}%
-
-🚦 Signal:
-<b>{signal}</b>
+🚦 <b>{signal}</b>
 
 ━━━━━━━━━━━━━━━━━━━━
 """
 
     bot.send_message(
-        chat_id,
-        text,
-        disable_web_page_preview=True
+        message.chat.id,
+        text
     )
 
 
-# ============================================================
-# OPEN TRADES
-# ============================================================
-
-def send_open(chat_id):
+@bot.message_handler(
+    commands=["open"]
+)
+def open_command(message):
 
     trades = state[
         "open_trades"
@@ -1716,36 +1728,35 @@ def send_open(chat_id):
     if not trades:
 
         bot.send_message(
-            chat_id,
+            message.chat.id,
             "📂 هیچ معامله بازی نداریم."
         )
 
         return
 
-    text = (
-        "<b>📂 OPEN TRADES</b>\n\n"
-    )
+    text = "<b>📂 OPEN TRADES V3</b>\n\n"
 
     for trade in trades:
 
-        entry = safe_float(
-            trade["entry_price"]
+        entry = f(
+            trade[
+                "entry_price"
+            ]
         )
 
-        current = safe_float(
-            trade.get(
-                "current_price",
-                entry
-            )
+        current = f(
+            trade[
+                "current_price"
+            ]
         )
 
-        pct = 0
-
-        if entry > 0:
-
-            pct = (
+        pct = (
+            (
                 current - entry
-            ) / entry * 100
+            )
+            / entry
+            * 100
+        )
 
         text += f"""
 🪙 <b>{trade["symbol"]}</b>
@@ -1756,29 +1767,25 @@ ${entry:.10f}
 📍 Current:
 ${current:.10f}
 
-📊 PnL:
+📊 Return:
 <b>{pct:+.2f}%</b>
 
 💰 Position:
-${trade["amount_usd"]:.4f}
-
-⭐ Score:
-{trade["score"]}
+${trade["position"]:.4f}
 
 ━━━━━━━━━━━━━━━━━━━━
 """
 
     bot.send_message(
-        chat_id,
+        message.chat.id,
         text
     )
 
 
-# ============================================================
-# HISTORY
-# ============================================================
-
-def send_history(chat_id):
+@bot.message_handler(
+    commands=["history"]
+)
+def history(message):
 
     trades = state[
         "closed_trades"
@@ -1787,33 +1794,31 @@ def send_history(chat_id):
     if not trades:
 
         bot.send_message(
-            chat_id,
-            "📜 هنوز معامله بسته‌شده‌ای نداریم."
+            message.chat.id,
+            "📜 هنوز معامله‌ای بسته نشده."
         )
 
         return
 
-    text = (
-        "<b>📜 HISTORY</b>\n\n"
-    )
+    text = "<b>📜 HISTORY V3</b>\n\n"
 
     for trade in trades[-15:]:
 
-        profit = safe_float(
-            trade.get(
-                "profit"
-            )
+        pnl = f(
+            trade[
+                "pnl"
+            ]
         )
 
-        pct = safe_float(
-            trade.get(
+        pct = f(
+            trade[
                 "return_percent"
-            )
+            ]
         )
 
         emoji = (
             "🟢"
-            if profit >= 0
+            if pnl >= 0
             else "🔴"
         )
 
@@ -1821,178 +1826,49 @@ def send_history(chat_id):
 {emoji} <b>{trade["symbol"]}</b>
 
 💰 PnL:
-{profit:+.4f} USD
+{pnl:+.4f} USD
 
 📊 Return:
 {pct:+.2f}%
 
-🎯 Reason:
-{trade.get("reason", "-")}
+🎯 {trade["exit_reason"]}
 
-🕐 Exit:
-{trade.get("exit_time", "-")}
+🕐 {trade["exit_time"]}
 
 ━━━━━━━━━━━━━━━━━━━━
 """
 
     bot.send_message(
-        chat_id,
+        message.chat.id,
         text
     )
 
 
 # ============================================================
-# BUY MESSAGE
-# ============================================================
-
-def send_buy_message(
-    token,
-    position_size
-):
-
-    chat_id = state.get(
-        "chat_id"
-    )
-
-    if not chat_id:
-        return
-
-    text = f"""
-<b>🚨 PAPER BUY V2</b>
-
-🪙 <b>{token["symbol"]}</b>
-
-⭐ Score:
-<b>{token["score"]}/100</b>
-
-💵 Price:
-${token["price"]:.10f}
-
-💧 Liquidity:
-${token["liquidity"]:,.0f}
-
-📊 M5 Volume:
-${token["volume"]:,.2f}
-
-🟢 Buy Pressure:
-{token["buy_pressure"]:.1f}%
-
-📈 M5:
-{token["m5_change"]:+.2f}%
-
-💰 Position:
-${position_size:.4f}
-
-🛡️ Risk:
-{POSITION_SIZE_PERCENT * 100:.0f}%
-
-🕐 {utc_now()}
-"""
-
-    try:
-
-        bot.send_message(
-            chat_id,
-            text
-        )
-
-    except Exception as e:
-
-        print(
-            "BUY MESSAGE ERROR:",
-            e
-        )
-
-
-# ============================================================
-# SELL MESSAGE
-# ============================================================
-
-def send_sell_message(
-    trade,
-    profit,
-    percent,
-    reason
-):
-
-    chat_id = state.get(
-        "chat_id"
-    )
-
-    if not chat_id:
-        return
-
-    emoji = (
-        "🟢"
-        if profit >= 0
-        else "🔴"
-    )
-
-    text = f"""
-<b>{emoji} PAPER SELL V2</b>
-
-🪙 <b>{trade["symbol"]}</b>
-
-💰 PnL:
-<b>{profit:+.4f} USD</b>
-
-📊 Return:
-<b>{percent:+.2f}%</b>
-
-🎯 Reason:
-<b>{reason}</b>
-
-💵 Cash:
-<b>{state["balance"]:.4f}</b>
-
-📊 Equity:
-<b>{calculate_equity():.4f}</b>
-
-🕐 {utc_now()}
-"""
-
-    try:
-
-        bot.send_message(
-            chat_id,
-            text
-        )
-
-    except Exception as e:
-
-        print(
-            "SELL MESSAGE ERROR:",
-            e
-        )
-
-
-# ============================================================
-# CALLBACK BUTTONS
+# CALLBACKS
 # ============================================================
 
 @bot.callback_query_handler(
     func=lambda call: True
 )
-def callback_handler(call):
+def callback(call):
 
     try:
 
         if call.data == "top":
 
-            send_top(
-                call.message.chat.id
-            )
+            top(call.message)
 
         elif call.data == "open":
 
-            send_open(
-                call.message.chat.id
+            open_command(
+                call.message
             )
 
         elif call.data == "history":
 
-            send_history(
-                call.message.chat.id
+            history(
+                call.message
             )
 
         elif call.data == "refresh":
@@ -2019,83 +1895,73 @@ def main():
 
     print("""
 ============================================================
-🦈 SOLANA HUNTER V2
+🦈 SOLANA HUNTER V3
 ============================================================
 
-MODE:
-PAPER TRADING
+🧪 PAPER TRADING ONLY
 
-STARTING BALANCE:
+Starting Balance:
 $3.5015
 
-MAX OPEN TRADES:
+Max Open:
 2
 
-POSITION SIZE:
+Risk / Trade:
 10%
 
-MIN SCORE:
+Min Score:
 75
 
-MIN BUY PRESSURE:
+Min Buy Pressure:
 60%
 
-MIN LIQUIDITY:
+Min Liquidity:
 $25,000
 
-MIN M5 VOLUME:
+Min M5 Volume:
 $10,000
 
-M5 RANGE:
--10% TO +20%
+M5 Range:
+-10% تا +20%
 
-TAKE PROFIT:
-15%
+Take Profit:
++15%
 
-STOP LOSS:
-8%
+Stop Loss:
+-8%
 
-TRAILING STOP:
-5%
+Trailing:
+فعال از +8%
+فاصله 5%
 
-SCAN:
-15 SECONDS
+Cooldown:
+10 minutes
 
-COOLDOWN:
-10 MINUTES
+Scan:
+15 seconds
 
 ============================================================
 """)
 
     load_state()
 
-    state[
-        "bot_started"
-    ] = True
-
-    save_state()
-
     # --------------------------------------------------------
-    # Trading thread
+    # Trading engine
     # --------------------------------------------------------
 
-    trading_thread = threading.Thread(
-        target=trading_loop,
+    thread = threading.Thread(
+        target=engine,
         daemon=True
     )
 
-    trading_thread.start()
+    thread.start()
 
     print(
-        "🟢 TRADING ENGINE STARTED"
-    )
-
-    print(
-        "📡 TELEGRAM STARTING..."
+        "🟢 V3 ENGINE STARTED"
     )
 
     # --------------------------------------------------------
-    # Telegram polling
+    # Telegram
     # --------------------------------------------------------
 
     while True:
