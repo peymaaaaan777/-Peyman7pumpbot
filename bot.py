@@ -5,6 +5,10 @@ import threading
 import requests
 import telebot
 
+# =========================================================
+# CONFIG
+# =========================================================
+
 TOKEN = os.getenv("BOT_TOKEN")
 
 if not TOKEN:
@@ -12,10 +16,19 @@ if not TOKEN:
 
 bot = telebot.TeleBot(TOKEN)
 
-API = "https://api.geckoterminal.com/api/v2/networks/solana/new_pools"
+NEW_POOLS_API = (
+    "https://api.geckoterminal.com/api/v2/"
+    "networks/solana/new_pools"
+)
+
+POOL_API = (
+    "https://api.geckoterminal.com/api/v2/"
+    "networks/solana/pools/"
+)
+
 STATE_FILE = "paper_state.json"
 
-START_BALANCE = 5.0
+START_BALANCE = 5.00
 TRADE_SIZE = 0.50
 
 TAKE_PROFIT = 0.20
@@ -25,16 +38,21 @@ MIN_SCORE = 70
 MIN_BUY_PRESSURE = 0.60
 MIN_M5_VOLUME = 100
 
-AUTO_SCAN_INTERVAL = 180
+AUTO_SCAN_SECONDS = 180
 
-CHAT_ID = None
+# برای جلوگیری از چند معامله روی یک توکن
+MAX_OPEN_TRADES = 3
 
+# =========================================================
+# STATE
+# =========================================================
 
 def default_state():
     return {
         "balance": START_BALANCE,
         "trades": [],
-        "open": {}
+        "open": {},
+        "chat_id": None
     }
 
 
@@ -44,10 +62,17 @@ def load_state():
         return default_state()
 
     try:
-        with open(STATE_FILE, "r") as f:
+
+        with open(
+            STATE_FILE,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
             return json.load(f)
 
     except Exception:
+
         return default_state()
 
 
@@ -56,13 +81,23 @@ state = load_state()
 
 def save_state():
 
-    with open(STATE_FILE, "w") as f:
+    with open(
+        STATE_FILE,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
         json.dump(
             state,
             f,
-            indent=2
+            indent=2,
+            ensure_ascii=False
         )
 
+
+# =========================================================
+# HELPERS
+# =========================================================
 
 def num(value):
 
@@ -73,23 +108,91 @@ def num(value):
         return 0.0
 
 
-def get_pools():
+def send_user(text):
+
+    chat_id = state.get("chat_id")
+
+    if not chat_id:
+        return
+
+    try:
+
+        bot.send_message(
+            chat_id,
+            text
+        )
+
+    except Exception as e:
+
+        print(
+            "Telegram error:",
+            e
+        )
+
+
+# =========================================================
+# API
+# =========================================================
+
+def api_get(url):
 
     response = requests.get(
-        API,
+
+        url,
+
         headers={
-            "Accept": "application/json"
+            "Accept":
+            "application/json;version=20230203"
         },
+
         timeout=20
     )
 
     response.raise_for_status()
 
-    return response.json().get(
+    return response.json()
+
+
+def get_new_pools():
+
+    data = api_get(
+        NEW_POOLS_API
+    )
+
+    return data.get(
         "data",
         []
     )
 
+
+def get_pool(address):
+
+    if not address:
+        return None
+
+    try:
+
+        data = api_get(
+            POOL_API + address
+        )
+
+        return data.get(
+            "data"
+        )
+
+    except Exception as e:
+
+        print(
+            "Pool lookup error:",
+            e
+        )
+
+        return None
+
+
+# =========================================================
+# PARSING
+# =========================================================
 
 def parse_pool(pool):
 
@@ -195,6 +298,10 @@ def parse_pool(pool):
     }
 
 
+# =========================================================
+# SCORING
+# =========================================================
+
 def score_pool(x):
 
     score = 0
@@ -206,57 +313,73 @@ def score_pool(x):
         x["sells"]
     )
 
-    # M5 Volume
+    # M5 volume
     if volume >= 10000:
+
         score += 25
 
     elif volume >= 1000:
+
         score += 20
 
     elif volume >= 250:
+
         score += 15
 
     elif volume >= 100:
+
         score += 8
 
     # Activity
     if total >= 100:
+
         score += 20
 
     elif total >= 50:
+
         score += 15
 
     elif total >= 20:
+
         score += 10
 
     elif total >= 10:
+
         score += 5
 
     # Buy pressure
     if x["buy_ratio"] >= 0.75:
+
         score += 35
 
     elif x["buy_ratio"] >= 0.65:
+
         score += 28
 
     elif x["buy_ratio"] >= 0.60:
+
         score += 20
 
     elif x["buy_ratio"] >= 0.55:
+
         score += 10
 
     # 24h volume
     if x["h24_volume"] >= 100000:
+
         score += 10
 
     elif x["h24_volume"] >= 10000:
+
         score += 7
 
     elif x["h24_volume"] >= 1000:
+
         score += 4
 
     # FDV
     if x["fdv"] >= 10000:
+
         score += 5
 
     return min(
@@ -264,6 +387,10 @@ def score_pool(x):
         100
     )
 
+
+# =========================================================
+# PAPER ENTRY
+# =========================================================
 
 def open_paper_trade(x, score):
 
@@ -273,6 +400,9 @@ def open_paper_trade(x, score):
         return False
 
     if address in state["open"]:
+        return False
+
+    if len(state["open"]) >= MAX_OPEN_TRADES:
         return False
 
     if score < MIN_SCORE:
@@ -300,6 +430,8 @@ def open_paper_trade(x, score):
 
         "entry": x["price"],
 
+        "last_price": x["price"],
+
         "size": TRADE_SIZE,
 
         "tp": (
@@ -324,60 +456,56 @@ def open_paper_trade(x, score):
     return True
 
 
-def update_trade(x):
+# =========================================================
+# POSITION MONITOR
+# =========================================================
 
-    address = x["address"]
+def close_trade(
+    address,
+    price,
+    reason
+):
 
     if address not in state["open"]:
         return None
 
     trade = state["open"][address]
 
-    price = x["price"]
+    entry = trade["entry"]
+    size = trade["size"]
 
-    if price <= 0:
-        return None
+    change = (
+        price - entry
+    ) / entry
 
-    result = None
-    pnl = 0
+    pnl = size * change
 
-    if price >= trade["tp"]:
+    # جلوگیری از اختلاف بیشتر از TP/SL
+    if reason == "TP":
 
-        pnl = (
-            trade["size"] *
-            TAKE_PROFIT
-        )
+        pnl = size * TAKE_PROFIT
 
-        result = "TP"
+    elif reason == "SL":
 
-    elif price <= trade["sl"]:
+        pnl = -size * STOP_LOSS
 
-        pnl = -(
-            trade["size"] *
-            STOP_LOSS
-        )
+    returned = size + pnl
 
-        result = "SL"
-
-    else:
-        return None
-
-    state["balance"] += (
-        trade["size"] +
-        pnl
-    )
+    state["balance"] += returned
 
     state["trades"].append({
 
         "name": trade["name"],
 
-        "entry": trade["entry"],
+        "address": address,
+
+        "entry": entry,
 
         "exit": price,
 
         "pnl": pnl,
 
-        "result": result,
+        "result": reason,
 
         "score": trade["score"],
 
@@ -390,33 +518,144 @@ def update_trade(x):
 
     save_state()
 
-    return result, pnl
+    return pnl
 
+
+def monitor_open_positions():
+
+    addresses = list(
+        state["open"].keys()
+    )
+
+    for address in addresses:
+
+        pool = get_pool(
+            address
+        )
+
+        if not pool:
+            continue
+
+        x = parse_pool(
+            pool
+        )
+
+        price = x["price"]
+
+        if price <= 0:
+            continue
+
+        trade = state["open"].get(
+            address
+        )
+
+        if not trade:
+            continue
+
+        trade["last_price"] = price
+
+        entry = trade["entry"]
+
+        change = (
+            (price - entry)
+            / entry
+        )
+
+        if price >= trade["tp"]:
+
+            pnl = close_trade(
+                address,
+                price,
+                "TP"
+            )
+
+            if pnl is not None:
+
+                send_user(
+
+                    "🎯 TAKE PROFIT\n\n"
+
+                    f"🪙 {trade['name']}\n"
+
+                    f"💵 Entry: "
+                    f"${entry:.10f}\n"
+
+                    f"💵 Exit: "
+                    f"${price:.10f}\n"
+
+                    f"📈 Change: "
+                    f"{change*100:+.2f}%\n"
+
+                    f"💰 PnL: "
+                    f"${pnl:+.4f}"
+                )
+
+        elif price <= trade["sl"]:
+
+            pnl = close_trade(
+                address,
+                price,
+                "SL"
+            )
+
+            if pnl is not None:
+
+                send_user(
+
+                    "🛑 STOP LOSS\n\n"
+
+                    f"🪙 {trade['name']}\n"
+
+                    f"💵 Entry: "
+                    f"${entry:.10f}\n"
+
+                    f"💵 Exit: "
+                    f"${price:.10f}\n"
+
+                    f"📉 Change: "
+                    f"{change*100:+.2f}%\n"
+
+                    f"💰 PnL: "
+                    f"${pnl:+.4f}"
+                )
+
+
+# =========================================================
+# MARKET SCANNER
+# =========================================================
 
 def scan_market():
 
-    pools = get_pools()
+    pools = get_new_pools()
 
     candidates = []
 
     for pool in pools:
 
-        x = parse_pool(pool)
+        x = parse_pool(
+            pool
+        )
 
         name = x["name"].upper()
 
+        # فقط جفت‌های سولانا
         if "SOL" not in name:
             continue
 
+        # حذف استیبل‌کوین‌ها
         if (
             "USDC" in name or
             "USDT" in name
         ):
             continue
 
-        closed = update_trade(x)
+        # حذف توکن‌های اصلی
+        if name.startswith("SOL /"):
+            continue
 
-        score = score_pool(x)
+        score = score_pool(
+            x
+        )
 
         opened = False
 
@@ -435,81 +674,23 @@ def scan_market():
 
                 "data": x,
 
-                "opened": opened,
-
-                "closed": closed
+                "opened": opened
             })
 
     candidates.sort(
+
         key=lambda item:
         item["score"],
+
         reverse=True
     )
 
     return candidates[:5]
 
 
-def send_auto_alert(results):
-
-    global CHAT_ID
-
-    if not CHAT_ID:
-        return
-
-    for item in results:
-
-        if not item["opened"]:
-            continue
-
-        x = item["data"]
-
-        message = (
-
-            "🚨 🦈 AUTO HUNTER\n\n"
-
-            f"🪙 {x['name']}\n"
-
-            f"⭐ Score: "
-            f"{item['score']}/100\n"
-
-            f"💵 Price: "
-            f"${x['price']:.10f}\n"
-
-            f"📊 M5 Volume: "
-            f"${x['m5_volume']:,.2f}\n"
-
-            f"🛒 Buys: "
-            f"{x['buys']}\n"
-
-            f"📉 Sells: "
-            f"{x['sells']}\n"
-
-            f"🟢 Buy pressure: "
-            f"{x['buy_ratio']*100:.0f}%\n\n"
-
-            "🧪 PAPER BUY OPEN\n"
-
-            f"💰 Size: ${TRADE_SIZE:.2f}\n"
-
-            f"🎯 TP: +{TAKE_PROFIT*100:.0f}%\n"
-
-            f"🛑 SL: -{STOP_LOSS*100:.0f}%"
-        )
-
-        try:
-
-            bot.send_message(
-                CHAT_ID,
-                message
-            )
-
-        except Exception as e:
-
-            print(
-                "Telegram error:",
-                e
-            )
-
+# =========================================================
+# AUTO HUNTER
+# =========================================================
 
 def auto_hunter():
 
@@ -521,56 +702,108 @@ def auto_hunter():
 
         try:
 
-            results = scan_market()
+            print(
+                "🔎 Checking open positions..."
+            )
+
+            monitor_open_positions()
 
             print(
-                "🔎 Auto scan:",
-                len(results),
-                "candidates"
+                "🔎 Scanning new pools..."
             )
 
-            send_auto_alert(
-                results
-            )
+            results = scan_market()
+
+            for item in results:
+
+                if not item["opened"]:
+                    continue
+
+                x = item["data"]
+
+                send_user(
+
+                    "🚨 🦈 NEW PAPER BUY\n\n"
+
+                    f"🪙 {x['name']}\n"
+
+                    f"⭐ Score: "
+                    f"{item['score']}/100\n"
+
+                    f"💵 Price: "
+                    f"${x['price']:.10f}\n"
+
+                    f"📊 M5 Volume: "
+                    f"${x['m5_volume']:,.2f}\n"
+
+                    f"🛒 Buys: "
+                    f"{x['buys']}\n"
+
+                    f"📉 Sells: "
+                    f"{x['sells']}\n"
+
+                    f"🟢 Buy pressure: "
+                    f"{x['buy_ratio']*100:.0f}%\n\n"
+
+                    f"💰 Size: "
+                    f"${TRADE_SIZE:.2f}\n"
+
+                    f"🎯 TP: "
+                    f"+{TAKE_PROFIT*100:.0f}%\n"
+
+                    f"🛑 SL: "
+                    f"-{STOP_LOSS*100:.0f}%"
+                )
 
         except Exception as e:
 
             print(
-                "❌ Auto scan error:",
+                "❌ Auto Hunter error:",
                 e
             )
 
-        time.sleep(
-            AUTO_SCAN_INTERVAL
+        print(
+            f"⏳ Next scan in "
+            f"{AUTO_SCAN_SECONDS} seconds"
         )
 
+        time.sleep(
+            AUTO_SCAN_SECONDS
+        )
+
+
+# =========================================================
+# TELEGRAM COMMANDS
+# =========================================================
 
 @bot.message_handler(
     commands=["start"]
 )
 def start(message):
 
-    global CHAT_ID
+    state["chat_id"] = message.chat.id
 
-    CHAT_ID = message.chat.id
+    save_state()
 
     bot.reply_to(
 
         message,
 
-        "🦈 Hunter v6 فعال شد!\n\n"
+        "🦈 Hunter FINAL فعال شد!\n\n"
 
         "🔄 Auto Scanner: فعال\n"
 
         "🧪 Paper Trading: فعال\n"
 
+        "📡 Position Monitor: فعال\n"
+
         "💰 Real Trading: خاموش\n\n"
 
-        "/hunt = شکار دستی\n"
+        "/hunt = شکار فوری\n"
 
-        "/paper = آمار\n"
+        "/paper = آمار معاملات\n"
 
-        "/status = وضعیت"
+        "/status = وضعیت ربات"
     )
 
 
@@ -579,9 +812,9 @@ def start(message):
 )
 def status(message):
 
-    global CHAT_ID
+    state["chat_id"] = message.chat.id
 
-    CHAT_ID = message.chat.id
+    save_state()
 
     bot.reply_to(
 
@@ -590,6 +823,8 @@ def status(message):
         "🟢 ربات آنلاین است\n\n"
 
         "🦈 Auto Hunter: فعال\n"
+
+        "📡 Position Monitor: فعال\n"
 
         "🧪 Paper Trading: فعال\n"
 
@@ -611,9 +846,9 @@ def status(message):
 )
 def hunt(message):
 
-    global CHAT_ID
+    state["chat_id"] = message.chat.id
 
-    CHAT_ID = message.chat.id
+    save_state()
 
     try:
 
@@ -678,16 +913,38 @@ def hunt(message):
                     "🧪 PAPER BUY: OPEN\n"
                 )
 
+            elif (
+                x["address"]
+                in state["open"]
+            ):
+
+                text += (
+                    "📂 POSITION: OPEN\n"
+                )
+
+            elif item["score"] >= MIN_SCORE:
+
+                text += (
+                    "👀 WATCHING\n"
+                )
+
+            else:
+
+                text += (
+                    "⏸️ FILTERED\n"
+                )
+
             text += "\n"
 
         text += (
 
             "🧪 Paper Trading فعال\n"
 
-            f"🎯 Score >= {MIN_SCORE}\n"
+            f"🎯 Score >= "
+            f"{MIN_SCORE}\n"
 
             f"🟢 Buy pressure >= "
-            f"{MIN_BUY_PRESSURE*100:.0f}%\n"
+            f"{MIN_BUY_PRESSURE*100:.0f}%\n\n"
 
             "⚠️ معامله واقعی خاموش است."
         )
@@ -714,22 +971,34 @@ def hunt(message):
 )
 def paper(message):
 
+    state["chat_id"] = message.chat.id
+
+    save_state()
+
     trades = state["trades"]
 
     wins = sum(
+
         1
+
         for t in trades
+
         if t["pnl"] > 0
     )
 
     losses = sum(
+
         1
+
         for t in trades
+
         if t["pnl"] < 0
     )
 
     pnl = sum(
+
         t["pnl"]
+
         for t in trades
     )
 
@@ -773,14 +1042,21 @@ def paper(message):
     )
 
 
+# =========================================================
+# START
+# =========================================================
+
 threading.Thread(
+
     target=auto_hunter,
+
     daemon=True
+
 ).start()
 
 
 print(
-    "🦈 Hunter v6 running..."
+    "🦈 Hunter FINAL running..."
 )
 
 bot.infinity_polling()
