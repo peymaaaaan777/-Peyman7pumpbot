@@ -1,21 +1,30 @@
 import os
-import time
 import json
+import time
 import threading
 import requests
 import telebot
 from telebot import types
 
 # =========================================================
-# 🦈 MEME HUNTER V9 FINAL
+# MEME HUNTER V9
+# Auto Meme Scanner + Paper Trading + Telegram Control
 # =========================================================
 
-TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+JUPITER_API_KEY = os.getenv("JUPITER_API_KEY")
 
-if not TOKEN:
-    raise ValueError("❌ BOT_TOKEN پیدا نشد")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN تنظیم نشده")
 
-bot = telebot.TeleBot(TOKEN)
+bot = telebot.TeleBot(BOT_TOKEN)
+
+STATE_FILE = "bot_state.json"
+
+START_BALANCE = 5.0
+SCAN_INTERVAL = 180
+
+SOL_MINT = "So11111111111111111111111111111111111111112"
 
 NEW_POOLS_API = (
     "https://api.geckoterminal.com/api/v2/"
@@ -27,10 +36,8 @@ POOL_API = (
     "networks/solana/pools/"
 )
 
-STATE_FILE = "bot_state.json"
+JUPITER_ORDER_API = "https://api.jup.ag/swap/v2/order"
 
-START_BALANCE = 5.00
-SCAN_INTERVAL = 180
 
 # =========================================================
 # DEFAULT SETTINGS
@@ -40,26 +47,23 @@ DEFAULT_SETTINGS = {
     "min_score": 60,
     "min_buy_pressure": 60,
     "min_liquidity": 5000,
-    "min_volume": 500,
+    "min_m5_volume": 500,
+
     "trade_size": 0.50,
+
     "take_profit": 20,
     "stop_loss": 10,
-    "max_open": 3,
+
+    "max_open": 2,
+
+    "daily_loss_limit": 10,
+
     "auto_hunter": True,
     "paper_trading": True,
-    "real_trading": False
+
+    "emergency_stop": False
 }
 
-BLOCKED_WORDS = [
-    "USDC",
-    "USDT",
-    "WSOL",
-    "SOL",
-    "BTC",
-    "ETH",
-    "WBTC",
-    "WETH"
-]
 
 # =========================================================
 # STATE
@@ -68,10 +72,18 @@ BLOCKED_WORDS = [
 def default_state():
     return {
         "balance": START_BALANCE,
-        "starting_balance": START_BALANCE,
-        "trades": [],
-        "open_positions": {},
+        "initial_balance": START_BALANCE,
+
         "chat_id": None,
+
+        "trades": [],
+
+        "open_positions": {},
+
+        "daily_pnl": 0.0,
+
+        "daily_date": time.strftime("%Y-%m-%d"),
+
         "settings": DEFAULT_SETTINGS.copy()
     }
 
@@ -91,16 +103,16 @@ def load_state():
 
             data = json.load(f)
 
-        result = default_state()
+        state = default_state()
 
-        result.update(data)
+        state.update(data)
 
-        result["settings"] = {
+        state["settings"] = {
             **DEFAULT_SETTINGS,
-            **result.get("settings", {})
+            **state.get("settings", {})
         }
 
-        return result
+        return state
 
     except Exception as e:
 
@@ -131,25 +143,40 @@ def save_state():
 
     except Exception as e:
 
-        print("Save error:", e)
+        print("State save error:", e)
+
+
+# =========================================================
+# DAILY RESET
+# =========================================================
+
+def daily_reset():
+
+    today = time.strftime("%Y-%m-%d")
+
+    if state.get("daily_date") != today:
+
+        state["daily_date"] = today
+
+        state["daily_pnl"] = 0.0
+
+        save_state()
 
 
 # =========================================================
 # HTTP
 # =========================================================
 
-def get_json(url):
-
-    headers = {
-        "Accept":
-        "application/json;version=20230203",
-        "User-Agent":
-        "MemeHunterV9/1.0"
-    }
+def get_json(
+    url,
+    headers=None,
+    params=None
+):
 
     response = requests.get(
         url,
         headers=headers,
+        params=params,
         timeout=20
     )
 
@@ -164,45 +191,36 @@ def get_json(url):
 
 def get_new_pools():
 
-    try:
+    headers = {
+        "Accept": "application/json"
+    }
 
-        data = get_json(
-            NEW_POOLS_API
-        )
+    data = get_json(
+        NEW_POOLS_API,
+        headers=headers
+    )
 
-        return data.get(
-            "data",
-            []
-        )
-
-    except Exception as e:
-
-        print(
-            "New pools error:",
-            e
-        )
-
-        return []
+    return data.get("data", [])
 
 
 def get_pool(address):
 
     try:
 
+        headers = {
+            "Accept": "application/json"
+        }
+
         data = get_json(
-            POOL_API + address
+            POOL_API + address,
+            headers=headers
         )
 
-        return data.get(
-            "data"
-        )
+        return data.get("data")
 
     except Exception as e:
 
-        print(
-            "Pool lookup error:",
-            e
-        )
+        print("Pool error:", e)
 
         return None
 
@@ -216,22 +234,9 @@ def number(value):
     try:
         return float(value or 0)
 
-    except:
+    except Exception:
         return 0.0
 
-
-def safe_int(value):
-
-    try:
-        return int(value or 0)
-
-    except:
-        return 0
-
-
-# =========================================================
-# PARSE
-# =========================================================
 
 def parse_pool(pool):
 
@@ -251,18 +256,18 @@ def parse_pool(pool):
         .get("volume_usd", {})
     )
 
-    buys = safe_int(
+    buys = int(
         transactions.get(
             "buys",
             0
-        )
+        ) or 0
     )
 
-    sells = safe_int(
+    sells = int(
         transactions.get(
             "sells",
             0
-        )
+        ) or 0
     )
 
     total = buys + sells
@@ -315,18 +320,9 @@ def parse_pool(pool):
             )
         ),
 
-        "h24_volume":
-        number(
-            volume.get(
-                "h24"
-            )
-        ),
+        "buys": buys,
 
-        "buys":
-        buys,
-
-        "sells":
-        sells,
+        "sells": sells,
 
         "buy_pressure":
         pressure
@@ -337,26 +333,39 @@ def parse_pool(pool):
 # MEME FILTER
 # =========================================================
 
-def is_meme_candidate(info):
+def meme_filter(info):
 
-    name = info["name"].upper()
+    name = (
+        info["name"]
+        .upper()
+    )
 
-    for word in BLOCKED_WORDS:
+    blocked = [
+        "USDC",
+        "USDT",
+        "USDE",
+        "DAI",
+        "USD",
+        "WSOL"
+    ]
 
-        if word in name:
+    for item in blocked:
+
+        if item in name:
+
             return False
 
-    if info["price"] <= 0:
+    if info["liquidity"] <= 0:
         return False
 
-    if info["liquidity"] <= 0:
+    if info["price"] <= 0:
         return False
 
     return True
 
 
 # =========================================================
-# SCORE V9
+# SCORE
 # =========================================================
 
 def calculate_score(info):
@@ -364,39 +373,44 @@ def calculate_score(info):
     score = 0
 
     volume = info["m5_volume"]
+
     liquidity = info["liquidity"]
-    pressure = info["buy_pressure"]
 
     buys = info["buys"]
+
     sells = info["sells"]
 
     total = buys + sells
 
-    # -------------------------
-    # VOLUME 25
-    # -------------------------
+    pressure = info["buy_pressure"]
 
-    if volume >= 20000:
+    fdv = info["fdv"]
+
+    # -----------------------------------------------------
+    # VOLUME
+    # -----------------------------------------------------
+
+    if volume >= 50000:
         score += 25
 
-    elif volume >= 10000:
+    elif volume >= 20000:
         score += 22
 
-    elif volume >= 5000:
-        score += 18
+    elif volume >= 10000:
+        score += 20
 
-    elif volume >= 2000:
-        score += 15
+    elif volume >= 5000:
+        score += 16
 
     elif volume >= 1000:
-        score += 11
+        score += 12
 
     elif volume >= 500:
-        score += 7
+        score += 8
 
-    # -------------------------
-    # LIQUIDITY 20
-    # -------------------------
+    # -----------------------------------------------------
+    # LIQUIDITY
+    # -----------------------------------------------------
 
     if liquidity >= 50000:
         score += 20
@@ -413,90 +427,63 @@ def calculate_score(info):
     elif liquidity >= 2500:
         score += 5
 
-    # -------------------------
-    # BUY PRESSURE 25
-    # -------------------------
+    # -----------------------------------------------------
+    # TRANSACTIONS
+    # -----------------------------------------------------
 
-    if pressure >= 0.85:
-        score += 25
+    if total >= 500:
+        score += 20
 
-    elif pressure >= 0.75:
-        score += 21
-
-    elif pressure >= 0.65:
+    elif total >= 250:
         score += 17
 
-    elif pressure >= 0.60:
-        score += 13
-
-    elif pressure >= 0.55:
-        score += 7
-
-    # -------------------------
-    # TRANSACTIONS 15
-    # -------------------------
-
-    if total >= 300:
-        score += 15
-
-    elif total >= 200:
-        score += 13
-
     elif total >= 100:
-        score += 10
+        score += 14
 
     elif total >= 50:
-        score += 7
+        score += 10
 
     elif total >= 20:
-        score += 4
+        score += 6
 
-    # -------------------------
-    # BUY/SELL BALANCE 15
-    # -------------------------
+    # -----------------------------------------------------
+    # BUY PRESSURE
+    # -----------------------------------------------------
 
-    if buys > sells * 3:
-        score += 15
+    if pressure >= 0.90:
+        score += 25
 
-    elif buys > sells * 2:
+    elif pressure >= 0.80:
+        score += 22
+
+    elif pressure >= 0.70:
+        score += 18
+
+    elif pressure >= 0.60:
         score += 12
 
-    elif buys > sells:
-        score += 8
+    elif pressure >= 0.55:
+        score += 6
 
-    elif buys == sells:
-        score += 3
+    # -----------------------------------------------------
+    # FDV
+    # -----------------------------------------------------
+
+    if fdv > 0:
+
+        if fdv <= 100000:
+            score += 10
+
+        elif fdv <= 500000:
+            score += 7
+
+        elif fdv <= 1000000:
+            score += 4
 
     return min(
         score,
         100
     )
-
-
-# =========================================================
-# RISK
-# =========================================================
-
-def risk_level(info):
-
-    liquidity = info["liquidity"]
-    volume = info["m5_volume"]
-    sells = info["sells"]
-    buys = info["buys"]
-
-    if liquidity < 2500:
-        return "🔴 HIGH"
-
-    if volume > liquidity * 5:
-        return "🔴 HIGH"
-
-    if sells > buys:
-        return "🟠 MEDIUM"
-
-    if buys >= sells * 2:
-        return "🟢 LOWER"
-
-    return "🟡 MEDIUM"
 
 
 # =========================================================
@@ -517,10 +504,18 @@ def qualifies(info, score):
     ):
         return False
 
-    if info["liquidity"] < s["min_liquidity"]:
+    if (
+        info["liquidity"]
+        <
+        s["min_liquidity"]
+    ):
         return False
 
-    if info["m5_volume"] < s["min_volume"]:
+    if (
+        info["m5_volume"]
+        <
+        s["min_m5_volume"]
+    ):
         return False
 
     return True
@@ -530,13 +525,24 @@ def qualifies(info, score):
 # PAPER BUY
 # =========================================================
 
-def paper_buy(info, score):
+def paper_buy(
+    info,
+    score
+):
+
+    daily_reset()
 
     s = state["settings"]
 
     address = info["address"]
 
     if not address:
+        return False
+
+    if state["emergency_stop"] if "emergency_stop" in state else False:
+        return False
+
+    if s["emergency_stop"]:
         return False
 
     if address in state["open_positions"]:
@@ -551,6 +557,19 @@ def paper_buy(info, score):
     if (
         len(state["open_positions"])
         >= s["max_open"]
+    ):
+        return False
+
+    max_daily_loss = (
+        state["initial_balance"]
+        *
+        s["daily_loss_limit"]
+        / 100
+    )
+
+    if (
+        state["daily_pnl"]
+        <= -max_daily_loss
     ):
         return False
 
@@ -591,7 +610,7 @@ def paper_buy(info, score):
 
 
 # =========================================================
-# CLOSE PAPER POSITION
+# PAPER CLOSE
 # =========================================================
 
 def close_position(
@@ -613,14 +632,14 @@ def close_position(
     if entry <= 0:
         return None
 
-    real_change = (
+    actual_change = (
         price - entry
     ) / entry
 
     pnl = (
         position["size"]
         *
-        real_change
+        actual_change
     )
 
     state["balance"] += (
@@ -628,6 +647,8 @@ def close_position(
         +
         pnl
     )
+
+    state["daily_pnl"] += pnl
 
     state["trades"].append({
 
@@ -640,6 +661,9 @@ def close_position(
         "exit":
         price,
 
+        "size":
+        position["size"],
+
         "pnl":
         pnl,
 
@@ -649,7 +673,7 @@ def close_position(
         "score":
         position["score"],
 
-        "closed":
+        "time":
         time.time()
     })
 
@@ -663,10 +687,12 @@ def close_position(
 
 
 # =========================================================
-# MONITOR
+# MONITOR POSITIONS
 # =========================================================
 
 def monitor_positions():
+
+    daily_reset()
 
     for address in list(
         state["open_positions"]
@@ -700,19 +726,23 @@ def monitor_positions():
 
             entry = position["entry"]
 
-            tp = entry * (
-                1 +
+            change = (
+                price - entry
+            ) / entry
+
+            tp = (
                 state["settings"]
-                ["take_profit"] / 100
+                ["take_profit"]
+                / 100
             )
 
-            sl = entry * (
-                1 -
+            sl = -(
                 state["settings"]
-                ["stop_loss"] / 100
+                ["stop_loss"]
+                / 100
             )
 
-            if price >= tp:
+            if change >= tp:
 
                 pnl = close_position(
                     address,
@@ -723,12 +753,13 @@ def monitor_positions():
                 notify(
                     "🎯 TAKE PROFIT\n\n"
                     f"🪙 {position['name']}\n"
-                    f"📈 Entry: ${entry:.10f}\n"
-                    f"📈 Exit: ${price:.10f}\n"
-                    f"💰 PnL: ${pnl:+.4f}"
+                    f"📈 Change: "
+                    f"{change*100:+.2f}%\n"
+                    f"💰 PnL: "
+                    f"${pnl:+.4f}"
                 )
 
-            elif price <= sl:
+            elif change <= sl:
 
                 pnl = close_position(
                     address,
@@ -739,9 +770,10 @@ def monitor_positions():
                 notify(
                     "🛑 STOP LOSS\n\n"
                     f"🪙 {position['name']}\n"
-                    f"📉 Entry: ${entry:.10f}\n"
-                    f"📉 Exit: ${price:.10f}\n"
-                    f"💰 PnL: ${pnl:+.4f}"
+                    f"📉 Change: "
+                    f"{change*100:+.2f}%\n"
+                    f"💰 PnL: "
+                    f"${pnl:+.4f}"
                 )
 
         except Exception as e:
@@ -753,12 +785,23 @@ def monitor_positions():
 
 
 # =========================================================
-# SCAN MARKET
+# SCANNER
 # =========================================================
 
 def scan_market():
 
-    pools = get_new_pools()
+    try:
+
+        pools = get_new_pools()
+
+    except Exception as e:
+
+        print(
+            "Market scan error:",
+            e
+        )
+
+        return []
 
     candidates = []
 
@@ -770,7 +813,7 @@ def scan_market():
                 pool
             )
 
-            if not is_meme_candidate(
+            if not meme_filter(
                 info
             ):
                 continue
@@ -779,49 +822,99 @@ def scan_market():
                 info
             )
 
-            if score < 30:
-                continue
+            if score >= 30:
 
-            opened = False
-
-            if (
-                state["settings"]
-                ["paper_trading"]
-            ):
-
-                opened = paper_buy(
-                    info,
-                    score
+                candidates.append(
+                    (
+                        score,
+                        info
+                    )
                 )
-
-            candidates.append({
-
-                "score":
-                score,
-
-                "info":
-                info,
-
-                "opened":
-                opened,
-
-                "risk":
-                risk_level(info)
-            })
 
         except Exception as e:
 
             print(
-                "Scanner error:",
+                "Scanner item error:",
                 e
             )
 
     candidates.sort(
-        key=lambda x: x["score"],
+        key=lambda x: x[0],
         reverse=True
     )
 
-    return candidates[:5]
+    return candidates[:10]
+
+
+# =========================================================
+# JUPITER QUOTE TEST
+# =========================================================
+
+def jupiter_test(
+    token_address
+):
+
+    if not JUPITER_API_KEY:
+
+        return {
+            "ok": False,
+            "error":
+            "JUPITER_API_KEY تنظیم نشده"
+        }
+
+    amount = int(
+        state["settings"]
+        ["trade_size"]
+        *
+        1_000_000_000
+    )
+
+    params = {
+
+        "inputMint":
+        SOL_MINT,
+
+        "outputMint":
+        token_address,
+
+        "amount":
+        str(amount)
+    }
+
+    headers = {
+
+        "x-api-key":
+        JUPITER_API_KEY
+    }
+
+    try:
+
+        response = requests.get(
+
+            JUPITER_ORDER_API,
+
+            params=params,
+
+            headers=headers,
+
+            timeout=20
+        )
+
+        response.raise_for_status()
+
+        return {
+            "ok": True,
+            "data":
+            response.json()
+        }
+
+    except Exception as e:
+
+        return {
+            "ok": False,
+            "error":
+            str(e)
+        }
 
 
 # =========================================================
@@ -847,57 +940,13 @@ def notify(text):
     except Exception as e:
 
         print(
-            "Notify error:",
+            "Telegram notify error:",
             e
         )
 
 
 # =========================================================
-# MAIN MENU
-# =========================================================
-
-def main_keyboard():
-
-    kb = types.InlineKeyboardMarkup()
-
-    kb.row(
-        types.InlineKeyboardButton(
-            "🦈 Hunt",
-            callback_data="hunt"
-        ),
-        types.InlineKeyboardButton(
-            "📊 Paper",
-            callback_data="paper"
-        )
-    )
-
-    kb.row(
-        types.InlineKeyboardButton(
-            "⚙️ Settings",
-            callback_data="settings"
-        ),
-        types.InlineKeyboardButton(
-            "📡 Status",
-            callback_data="status"
-        )
-    )
-
-    kb.row(
-        types.InlineKeyboardButton(
-            "📂 Positions",
-            callback_data="positions"
-        ),
-        types.InlineKeyboardButton(
-            "🔄 Refresh",
-            callback_data="refresh"
-        )
-    )
-
-    return kb
-
-
-# =========================================================
-# SETTINGS
+# SETTINGS TEXT
 # =========================================================
 
 def settings_text():
@@ -918,7 +967,7 @@ def settings_text():
         f"${s['min_liquidity']:,.0f}\n"
 
         f"📊 حداقل M5 Volume: "
-        f"${s['min_volume']:,.0f}\n\n"
+        f"${s['min_m5_volume']:,.0f}\n\n"
 
         f"💵 حجم معامله: "
         f"${s['trade_size']:.2f}\n"
@@ -930,7 +979,10 @@ def settings_text():
         f"{s['stop_loss']}%\n"
 
         f"📂 Max Open: "
-        f"{s['max_open']}\n\n"
+        f"{s['max_open']}\n"
+
+        f"🚨 Daily Loss Limit: "
+        f"{s['daily_loss_limit']}%\n\n"
 
         f"🦈 Auto Hunter: "
         f"{'🟢 روشن' if s['auto_hunter'] else '🔴 خاموش'}\n"
@@ -938,218 +990,171 @@ def settings_text():
         f"🧪 Paper Trading: "
         f"{'🟢 روشن' if s['paper_trading'] else '🔴 خاموش'}\n\n"
 
-        "💰 Real Trading: 🔒 قفل"
+        f"🚨 Emergency Stop: "
+        f"{'🔴 فعال' if s['emergency_stop'] else '🟢 خاموش'}\n\n"
+
+        "💰 Real Trading: 🔒 تأیید دستی"
     )
 
 
+# =========================================================
+# SETTINGS KEYBOARD
+# =========================================================
+
 def settings_keyboard():
 
-    kb = types.InlineKeyboardMarkup()
+    k = types.InlineKeyboardMarkup()
 
-    kb.row(
+    k.row(
+
         types.InlineKeyboardButton(
-            "⭐ Score -",
+            "⭐ Score −",
             callback_data="score_minus"
         ),
+
         types.InlineKeyboardButton(
             "⭐ Score +",
             callback_data="score_plus"
         )
     )
 
-    kb.row(
+    k.row(
+
         types.InlineKeyboardButton(
-            "🟢 Buy% -",
+            "🟢 Buy% −",
             callback_data="buy_minus"
         ),
+
         types.InlineKeyboardButton(
             "🟢 Buy% +",
             callback_data="buy_plus"
         )
     )
 
-    kb.row(
-        types.InlineKeyboardButton(
-            "💧 Liquidity -",
-            callback_data="liq_minus"
-        ),
-        types.InlineKeyboardButton(
-            "💧 Liquidity +",
-            callback_data="liq_plus"
-        )
-    )
+    k.row(
 
-    kb.row(
         types.InlineKeyboardButton(
-            "📊 Volume -",
-            callback_data="vol_minus"
-        ),
-        types.InlineKeyboardButton(
-            "📊 Volume +",
-            callback_data="vol_plus"
-        )
-    )
-
-    kb.row(
-        types.InlineKeyboardButton(
-            "💵 مبلغ -",
+            "💵 مبلغ −",
             callback_data="size_minus"
         ),
+
         types.InlineKeyboardButton(
             "💵 مبلغ +",
             callback_data="size_plus"
         )
     )
 
-    kb.row(
+    k.row(
+
         types.InlineKeyboardButton(
-            "🎯 TP -",
+            "💧 Liquidity −",
+            callback_data="liq_minus"
+        ),
+
+        types.InlineKeyboardButton(
+            "💧 Liquidity +",
+            callback_data="liq_plus"
+        )
+    )
+
+    k.row(
+
+        types.InlineKeyboardButton(
+            "📊 Volume −",
+            callback_data="vol_minus"
+        ),
+
+        types.InlineKeyboardButton(
+            "📊 Volume +",
+            callback_data="vol_plus"
+        )
+    )
+
+    k.row(
+
+        types.InlineKeyboardButton(
+            "🎯 TP −",
             callback_data="tp_minus"
         ),
+
         types.InlineKeyboardButton(
             "🎯 TP +",
             callback_data="tp_plus"
         )
     )
 
-    kb.row(
+    k.row(
+
         types.InlineKeyboardButton(
-            "🛑 SL -",
+            "🛑 SL −",
             callback_data="sl_minus"
         ),
+
         types.InlineKeyboardButton(
             "🛑 SL +",
             callback_data="sl_plus"
         )
     )
 
-    kb.row(
+    k.row(
+
+        types.InlineKeyboardButton(
+            "📂 Max Open −",
+            callback_data="open_minus"
+        ),
+
+        types.InlineKeyboardButton(
+            "📂 Max Open +",
+            callback_data="open_plus"
+        )
+    )
+
+    k.row(
+
+        types.InlineKeyboardButton(
+            "🚨 Daily Loss −",
+            callback_data="loss_minus"
+        ),
+
+        types.InlineKeyboardButton(
+            "🚨 Daily Loss +",
+            callback_data="loss_plus"
+        )
+    )
+
+    k.row(
+
         types.InlineKeyboardButton(
             "🦈 Auto ON/OFF",
             callback_data="auto"
         )
     )
 
-    kb.row(
+    k.row(
+
         types.InlineKeyboardButton(
             "🧪 Paper ON/OFF",
             callback_data="paper"
         )
     )
 
-    kb.row(
+    k.row(
+
         types.InlineKeyboardButton(
-            "🔒 Real Trading",
-            callback_data="real"
+            "🚨 EMERGENCY STOP",
+            callback_data="emergency"
         )
     )
 
-    kb.row(
+    k.row(
+
         types.InlineKeyboardButton(
-            "🔙 منوی اصلی",
-            callback_data="home"
+            "🪐 Jupiter Test",
+            callback_data="jupiter"
         )
     )
 
-    return kb
-
-
-# =========================================================
-# HUNT TEXT
-# =========================================================
-
-def hunt_text(candidates):
-
-    if not candidates:
-
-        return (
-            "🦈 فعلاً هیچ Meme Coin مناسبی "
-            "پیدا نشد."
-        )
-
-    text = (
-        "🦈 TOP MEME HUNTS V9\n\n"
-    )
-
-    for i, item in enumerate(
-        candidates,
-        1
-    ):
-
-        info = item["info"]
-        score = item["score"]
-
-        if item["opened"]:
-
-            status = "🧪 PAPER BUY: OPEN"
-
-        elif qualifies(
-            info,
-            score
-        ):
-
-            status = "🎯 QUALIFIED"
-
-        else:
-
-            status = "👀 WATCHING"
-
-        text += (
-
-            f"#{i} 🪙 "
-            f"{info['name']}\n"
-
-            f"⭐ Score: "
-            f"{score}/100\n"
-
-            f"💵 Price: "
-            f"${info['price']:.10f}\n"
-
-            f"📊 M5 Volume: "
-            f"${info['m5_volume']:,.2f}\n"
-
-            f"💧 Liquidity: "
-            f"${info['liquidity']:,.2f}\n"
-
-            f"🛒 Buys: "
-            f"{info['buys']}\n"
-
-            f"📉 Sells: "
-            f"{info['sells']}\n"
-
-            f"🟢 Buy pressure: "
-            f"{info['buy_pressure'] * 100:.0f}%\n"
-
-            f"⚠️ Risk: "
-            f"{item['risk']}\n"
-
-            f"{status}\n\n"
-        )
-
-    s = state["settings"]
-
-    text += (
-
-        "⚙️ FILTERS\n"
-
-        f"⭐ Score ≥ {s['min_score']}\n"
-
-        f"🟢 Buy Pressure ≥ "
-        f"{s['min_buy_pressure']}%\n"
-
-        f"💧 Liquidity ≥ "
-        f"${s['min_liquidity']:,.0f}\n"
-
-        f"📊 M5 Volume ≥ "
-        f"${s['min_volume']:,.0f}\n\n"
-
-        "🧪 Paper Trading: "
-        f"{'ON' if s['paper_trading'] else 'OFF'}\n"
-
-        "💰 Real Trading: 🔒 LOCKED"
-    )
-
-    return text
+    return k
 
 
 # =========================================================
@@ -1161,23 +1166,60 @@ def hunt_text(candidates):
 )
 def start(message):
 
-    state["chat_id"] = message.chat.id
+    state["chat_id"] = (
+        message.chat.id
+    )
 
     save_state()
 
+    keyboard = types.InlineKeyboardMarkup()
+
+    keyboard.row(
+
+        types.InlineKeyboardButton(
+            "🦈 Hunt",
+            callback_data="menu_hunt"
+        ),
+
+        types.InlineKeyboardButton(
+            "⚙️ Settings",
+            callback_data="menu_settings"
+        )
+    )
+
+    keyboard.row(
+
+        types.InlineKeyboardButton(
+            "📊 Paper",
+            callback_data="menu_paper"
+        ),
+
+        types.InlineKeyboardButton(
+            "📡 Status",
+            callback_data="menu_status"
+        )
+    )
+
     bot.send_message(
+
         message.chat.id,
-        "🦈 MEME HUNTER V9 FINAL\n\n"
-        "ربات آماده است.\n"
-        "تمام کنترل‌های اصلی از همین منو انجام می‌شود.\n\n"
+
+        "🦈 MEME HUNTER V9\n\n"
+
+        "ربات آماده است.\n\n"
+
         "🧪 Paper Trading فعال است.\n"
-        "💰 Real Trading فعلاً قفل است. 🔒",
-        reply_markup=main_keyboard()
+
+        "💰 Real Trading با تأیید دستی انجام می‌شود.\n\n"
+
+        "از منوی زیر کنترلش کن:",
+
+        reply_markup=keyboard
     )
 
 
 # =========================================================
-# SETTINGS COMMAND
+# SETTINGS
 # =========================================================
 
 @bot.message_handler(
@@ -1185,59 +1227,75 @@ def start(message):
 )
 def settings_command(message):
 
-    state["chat_id"] = message.chat.id
+    state["chat_id"] = (
+        message.chat.id
+    )
 
     save_state()
 
     bot.send_message(
+
         message.chat.id,
+
         settings_text(),
-        reply_markup=settings_keyboard()
+
+        reply_markup=
+        settings_keyboard()
     )
 
 
 # =========================================================
-# HUNT COMMAND
+# STATUS
 # =========================================================
 
 @bot.message_handler(
-    commands=["hunt"]
+    commands=["status"]
 )
-def hunt_command(message):
+def status_command(message):
 
-    state["chat_id"] = message.chat.id
+    daily_reset()
 
-    save_state()
+    s = state["settings"]
 
-    bot.send_message(
-        message.chat.id,
-        "🔎 در حال شکار Meme Coin های سولانا..."
-    )
+    bot.reply_to(
 
-    candidates = scan_market()
+        message,
 
-    bot.send_message(
-        message.chat.id,
-        hunt_text(candidates),
-        reply_markup=main_keyboard()
+        "📡 MEME HUNTER STATUS\n\n"
+
+        "🟢 Online\n\n"
+
+        f"💵 Balance: "
+        f"${state['balance']:.4f}\n"
+
+        f"📂 Open: "
+        f"{len(state['open_positions'])}\n"
+
+        f"🔢 Closed: "
+        f"{len(state['trades'])}\n"
+
+        f"💰 Daily PnL: "
+        f"${state['daily_pnl']:+.4f}\n\n"
+
+        f"🦈 Auto: "
+        f"{'ON' if s['auto_hunter'] else 'OFF'}\n"
+
+        f"🧪 Paper: "
+        f"{'ON' if s['paper_trading'] else 'OFF'}\n"
+
+        f"🚨 Emergency: "
+        f"{'ON' if s['emergency_stop'] else 'OFF'}"
     )
 
 
 # =========================================================
-# PAPER COMMAND
+# PAPER STATS
 # =========================================================
 
 @bot.message_handler(
     commands=["paper"]
 )
 def paper_command(message):
-
-    send_paper(
-        message.chat.id
-    )
-
-
-def send_paper(chat_id):
 
     trades = state["trades"]
 
@@ -1261,19 +1319,22 @@ def send_paper(chat_id):
     )
 
     win_rate = (
+
         wins / total * 100
+
         if total
+
         else 0
     )
 
-    bot.send_message(
+    bot.reply_to(
 
-        chat_id,
+        message,
 
-        "🧪 PAPER TRADING V9\n\n"
+        "🧪 PAPER TRADING\n\n"
 
         f"💵 Balance: "
-        f"${state['balance']:.2f}\n"
+        f"${state['balance']:.4f}\n"
 
         f"📂 Open: "
         f"{len(state['open_positions'])}\n"
@@ -1287,64 +1348,118 @@ def send_paper(chat_id):
         f"❌ Losses: "
         f"{losses}\n"
 
-        f"🎯 Win rate: "
+        f"🎯 Win Rate: "
         f"{win_rate:.1f}%\n"
 
         f"💰 PnL: "
-        f"${pnl:+.4f}",
-
-        reply_markup=main_keyboard()
+        f"${pnl:+.4f}"
     )
 
 
 # =========================================================
-# STATUS
+# HUNT
 # =========================================================
-
-def send_status(chat_id):
-
-    s = state["settings"]
-
-    bot.send_message(
-
-        chat_id,
-
-        "📡 MEME HUNTER STATUS\n\n"
-
-        "🟢 Bot: ONLINE\n"
-
-        f"🦈 Auto Hunter: "
-        f"{'ON' if s['auto_hunter'] else 'OFF'}\n"
-
-        f"🧪 Paper Trading: "
-        f"{'ON' if s['paper_trading'] else 'OFF'}\n"
-
-        "💰 Real Trading: 🔒 LOCKED\n\n"
-
-        f"💵 Balance: "
-        f"${state['balance']:.2f}\n"
-
-        f"📂 Open Positions: "
-        f"{len(state['open_positions'])}\n"
-
-        f"🔢 Closed Trades: "
-        f"{len(state['trades'])}",
-
-        reply_markup=main_keyboard()
-    )
-
 
 @bot.message_handler(
-    commands=["status"]
+    commands=["hunt"]
 )
-def status_command(message):
+def hunt_command(message):
 
-    state["chat_id"] = message.chat.id
+    state["chat_id"] = (
+        message.chat.id
+    )
 
     save_state()
 
-    send_status(
-        message.chat.id
+    bot.send_message(
+
+        message.chat.id,
+
+        "🔎 در حال اسکن Meme Coinهای Solana..."
+    )
+
+    candidates = scan_market()
+
+    if not candidates:
+
+        bot.send_message(
+
+            message.chat.id,
+
+            "🦈 فعلاً کاندید مناسبی پیدا نشد."
+        )
+
+        return
+
+    text = (
+        "🦈 TOP MEME HUNTS V9\n\n"
+    )
+
+    for index, (
+        score,
+        info
+    ) in enumerate(
+        candidates[:5],
+        1
+    ):
+
+        qualified = qualifies(
+            info,
+            score
+        )
+
+        text += (
+
+            f"#{index} 🪙 "
+            f"{info['name']}\n"
+
+            f"⭐ Score: "
+            f"{score}/100\n"
+
+            f"💵 Price: "
+            f"${info['price']:.10f}\n"
+
+            f"📊 M5 Volume: "
+            f"${info['m5_volume']:,.2f}\n"
+
+            f"💧 Liquidity: "
+            f"${info['liquidity']:,.2f}\n"
+
+            f"🛒 Buys: "
+            f"{info['buys']}\n"
+
+            f"📉 Sells: "
+            f"{info['sells']}\n"
+
+            f"🟢 Buy Pressure: "
+            f"{info['buy_pressure']*100:.0f}%\n"
+
+            f"{'🎯 QUALIFIED' if qualified else '👀 WATCHING'}\n\n"
+        )
+
+    text += (
+
+        "⚙️ FILTERS\n"
+
+        f"⭐ Score ≥ "
+        f"{state['settings']['min_score']}\n"
+
+        f"🟢 Buy Pressure ≥ "
+        f"{state['settings']['min_buy_pressure']}%\n"
+
+        f"💧 Liquidity ≥ "
+        f"${state['settings']['min_liquidity']:,.0f}\n"
+
+        f"📊 M5 Volume ≥ "
+        f"${state['settings']['min_m5_volume']:,.0f}\n\n"
+
+        "🧪 Paper Trading: "
+        f"{'ON' if state['settings']['paper_trading'] else 'OFF'}"
+    )
+
+    bot.send_message(
+        message.chat.id,
+        text
     )
 
 
@@ -1361,323 +1476,382 @@ def callbacks(call):
 
     s = state["settings"]
 
-    try:
+    # -----------------------------------------------------
+    # MENU
+    # -----------------------------------------------------
 
-        if data == "home":
+    if data == "menu_settings":
 
-            bot.edit_message_text(
-                "🦈 MEME HUNTER V9\n\n"
-                "آماده شکار هستیم. 🦈",
-                call.message.chat.id,
-                call.message.message_id,
-                reply_markup=main_keyboard()
+        bot.answer_callback_query(
+            call.id
+        )
+
+        bot.send_message(
+
+            call.message.chat.id,
+
+            settings_text(),
+
+            reply_markup=
+            settings_keyboard()
+        )
+
+        return
+
+    if data == "menu_hunt":
+
+        bot.answer_callback_query(
+            call.id
+        )
+
+        bot.send_message(
+
+            call.message.chat.id,
+
+            "🔎 برای اسکن، دستور /hunt را بزن."
+        )
+
+        return
+
+    if data == "menu_paper":
+
+        bot.answer_callback_query(
+            call.id
+        )
+
+        paper_command(
+            call.message
+        )
+
+        return
+
+    if data == "menu_status":
+
+        bot.answer_callback_query(
+            call.id
+        )
+
+        status_command(
+            call.message
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # SCORE
+    # -----------------------------------------------------
+
+    if data == "score_minus":
+
+        s["min_score"] = max(
+            30,
+            s["min_score"] - 5
+        )
+
+    elif data == "score_plus":
+
+        s["min_score"] = min(
+            95,
+            s["min_score"] + 5
+        )
+
+    # -----------------------------------------------------
+    # BUY PRESSURE
+    # -----------------------------------------------------
+
+    elif data == "buy_minus":
+
+        s["min_buy_pressure"] = max(
+            50,
+            s["min_buy_pressure"] - 5
+        )
+
+    elif data == "buy_plus":
+
+        s["min_buy_pressure"] = min(
+            95,
+            s["min_buy_pressure"] + 5
+        )
+
+    # -----------------------------------------------------
+    # TRADE SIZE
+    # -----------------------------------------------------
+
+    elif data == "size_minus":
+
+        s["trade_size"] = max(
+            0.10,
+            round(
+                s["trade_size"] - 0.10,
+                2
             )
+        )
 
-        elif data == "hunt":
+    elif data == "size_plus":
 
-            bot.answer_callback_query(
-                call.id,
-                "🔎 در حال اسکن..."
+        s["trade_size"] = min(
+            200.0,
+            round(
+                s["trade_size"] + 0.10,
+                2
             )
+        )
 
-            candidates = scan_market()
+    # -----------------------------------------------------
+    # LIQUIDITY
+    # -----------------------------------------------------
 
-            bot.edit_message_text(
-                hunt_text(candidates),
-                call.message.chat.id,
-                call.message.message_id,
-                reply_markup=main_keyboard()
-            )
+    elif data == "liq_minus":
 
-        elif data == "paper":
+        s["min_liquidity"] = max(
+            1000,
+            s["min_liquidity"] - 1000
+        )
 
-            bot.answer_callback_query(
-                call.id
-            )
+    elif data == "liq_plus":
 
-            send_paper(
-                call.message.chat.id
-            )
+        s["min_liquidity"] += 1000
 
-        elif data == "status":
+    # -----------------------------------------------------
+    # VOLUME
+    # -----------------------------------------------------
 
-            bot.answer_callback_query(
-                call.id
-            )
+    elif data == "vol_minus":
 
-            send_status(
-                call.message.chat.id
-            )
+        s["min_m5_volume"] = max(
+            100,
+            s["min_m5_volume"] - 100
+        )
 
-        elif data == "settings":
+    elif data == "vol_plus":
 
-            bot.edit_message_text(
-                settings_text(),
-                call.message.chat.id,
-                call.message.message_id,
-                reply_markup=settings_keyboard()
-            )
+        s["min_m5_volume"] += 100
 
-        elif data == "refresh":
+    # -----------------------------------------------------
+    # TP
+    # -----------------------------------------------------
 
-            bot.answer_callback_query(
-                call.id,
-                "🔄 به‌روزرسانی شد"
-            )
+    elif data == "tp_minus":
 
-            candidates = scan_market()
+        s["take_profit"] = max(
+            5,
+            s["take_profit"] - 5
+        )
 
-            bot.edit_message_text(
-                hunt_text(candidates),
-                call.message.chat.id,
-                call.message.message_id,
-                reply_markup=main_keyboard()
-            )
+    elif data == "tp_plus":
 
-        elif data == "positions":
+        s["take_profit"] = min(
+            100,
+            s["take_profit"] + 5
+        )
 
-            text = (
-                "📂 OPEN POSITIONS\n\n"
-            )
+    # -----------------------------------------------------
+    # SL
+    # -----------------------------------------------------
 
-            if not state["open_positions"]:
+    elif data == "sl_minus":
 
-                text += "❌ پوزیشن بازی وجود ندارد."
+        s["stop_loss"] = max(
+            5,
+            s["stop_loss"] - 5
+        )
 
-            else:
+    elif data == "sl_plus":
 
-                for position in state[
-                    "open_positions"
-                ].values():
+        s["stop_loss"] = min(
+            50,
+            s["stop_loss"] + 5
+        )
 
-                    text += (
+    # -----------------------------------------------------
+    # MAX OPEN
+    # -----------------------------------------------------
 
-                        f"🪙 {position['name']}\n"
+    elif data == "open_minus":
 
-                        f"💵 Entry: "
-                        f"${position['entry']:.10f}\n"
+        s["max_open"] = max(
+            1,
+            s["max_open"] - 1
+        )
 
-                        f"💰 Size: "
-                        f"${position['size']:.2f}\n"
+    elif data == "open_plus":
 
-                        f"⭐ Score: "
-                        f"{position['score']}/100\n\n"
-                    )
+        s["max_open"] = min(
+            10,
+            s["max_open"] + 1
+        )
 
-            bot.send_message(
-                call.message.chat.id,
-                text,
-                reply_markup=main_keyboard()
-            )
+    # -----------------------------------------------------
+    # DAILY LOSS
+    # -----------------------------------------------------
 
-        # -------------------------
-        # SCORE
-        # -------------------------
+    elif data == "loss_minus":
 
-        elif data == "score_minus":
+        s["daily_loss_limit"] = max(
+            1,
+            s["daily_loss_limit"] - 1
+        )
 
-            s["min_score"] = max(
-                40,
-                s["min_score"] - 5
-            )
+    elif data == "loss_plus":
 
-        elif data == "score_plus":
+        s["daily_loss_limit"] = min(
+            50,
+            s["daily_loss_limit"] + 1
+        )
 
-            s["min_score"] = min(
-                90,
-                s["min_score"] + 5
-            )
+    # -----------------------------------------------------
+    # AUTO
+    # -----------------------------------------------------
 
-        # -------------------------
-        # BUY PRESSURE
-        # -------------------------
+    elif data == "auto":
 
-        elif data == "buy_minus":
+        s["auto_hunter"] = (
+            not s["auto_hunter"]
+        )
 
-            s["min_buy_pressure"] = max(
-                50,
-                s["min_buy_pressure"] - 5
-            )
+    # -----------------------------------------------------
+    # PAPER
+    # -----------------------------------------------------
 
-        elif data == "buy_plus":
+    elif data == "paper":
 
-            s["min_buy_pressure"] = min(
-                90,
-                s["min_buy_pressure"] + 5
-            )
+        s["paper_trading"] = (
+            not s["paper_trading"]
+        )
 
-        # -------------------------
-        # LIQUIDITY
-        # -------------------------
+    # -----------------------------------------------------
+    # EMERGENCY
+    # -----------------------------------------------------
 
-        elif data == "liq_minus":
+    elif data == "emergency":
 
-            s["min_liquidity"] = max(
-                1000,
-                s["min_liquidity"] - 1000
-            )
+        s["emergency_stop"] = True
 
-        elif data == "liq_plus":
+        s["auto_hunter"] = False
 
-            s["min_liquidity"] = min(
-                50000,
-                s["min_liquidity"] + 1000
-            )
+        bot.answer_callback_query(
 
-        # -------------------------
-        # VOLUME
-        # -------------------------
+            call.id,
 
-        elif data == "vol_minus":
+            "🚨 Emergency Stop فعال شد",
 
-            s["min_volume"] = max(
-                100,
-                s["min_volume"] - 250
-            )
-
-        elif data == "vol_plus":
-
-            s["min_volume"] = min(
-                20000,
-                s["min_volume"] + 250
-            )
-
-        # -------------------------
-        # SIZE
-        # -------------------------
-
-        elif data == "size_minus":
-
-            s["trade_size"] = max(
-                0.10,
-                round(
-                    s["trade_size"] - 0.10,
-                    2
-                )
-            )
-
-        elif data == "size_plus":
-
-            s["trade_size"] = min(
-                5.00,
-                round(
-                    s["trade_size"] + 0.10,
-                    2
-                )
-            )
-
-        # -------------------------
-        # TP
-        # -------------------------
-
-        elif data == "tp_minus":
-
-            s["take_profit"] = max(
-                5,
-                s["take_profit"] - 5
-            )
-
-        elif data == "tp_plus":
-
-            s["take_profit"] = min(
-                100,
-                s["take_profit"] + 5
-            )
-
-        # -------------------------
-        # SL
-        # -------------------------
-
-        elif data == "sl_minus":
-
-            s["stop_loss"] = max(
-                5,
-                s["stop_loss"] - 5
-            )
-
-        elif data == "sl_plus":
-
-            s["stop_loss"] = min(
-                50,
-                s["stop_loss"] + 5
-            )
-
-        # -------------------------
-        # AUTO
-        # -------------------------
-
-        elif data == "auto":
-
-            s["auto_hunter"] = not s[
-                "auto_hunter"
-            ]
-
-        # -------------------------
-        # PAPER
-        # -------------------------
-
-        elif data == "paper_toggle":
-
-            s["paper_trading"] = not s[
-                "paper_trading"
-            ]
-
-        # -------------------------
-        # REAL
-        # -------------------------
-
-        elif data == "real":
-
-            bot.answer_callback_query(
-
-                call.id,
-
-                "🔒 Real Trading در V9 قفل است. "
-                "هیچ کلید خصوصی داخل ربات ذخیره نمی‌شود.",
-
-                show_alert=True
-            )
-
-            return
-
-        else:
-
-            bot.answer_callback_query(
-                call.id
-            )
-
-            return
+            show_alert=True
+        )
 
         save_state()
 
+        try:
+
+            bot.edit_message_text(
+
+                settings_text(),
+
+                call.message.chat.id,
+
+                call.message.message_id,
+
+                reply_markup=
+                settings_keyboard()
+            )
+
+        except Exception:
+            pass
+
+        return
+
+    # -----------------------------------------------------
+    # JUPITER
+    # -----------------------------------------------------
+
+    elif data == "jupiter":
+
         bot.answer_callback_query(
+
             call.id,
-            "✅ ذخیره شد"
+
+            "🪐 در حال تست Jupiter..."
         )
 
-        bot.edit_message_text(
-            settings_text(),
+        candidates = scan_market()
+
+        if not candidates:
+
+            bot.send_message(
+
+                call.message.chat.id,
+
+                "❌ کاندید مناسبی پیدا نشد."
+            )
+
+            return
+
+        score, info = candidates[0]
+
+        result = jupiter_test(
+            info["address"]
+        )
+
+        if not result["ok"]:
+
+            bot.send_message(
+
+                call.message.chat.id,
+
+                "❌ Jupiter Test Failed\n\n"
+                f"{result['error']}"
+            )
+
+            return
+
+        bot.send_message(
+
             call.message.chat.id,
+
+            "🪐 JUPITER TEST\n\n"
+
+            f"🪙 {info['name']}\n"
+
+            f"⭐ Score: "
+            f"{score}/100\n\n"
+
+            "✅ Quote دریافت شد.\n"
+
+            "🧪 Paper Trading فعال است.\n"
+
+            "💰 معامله واقعی بدون تأیید دستی انجام نمی‌شود."
+        )
+
+        return
+
+    save_state()
+
+    bot.answer_callback_query(
+
+        call.id,
+
+        "✅ ذخیره شد"
+    )
+
+    try:
+
+        bot.edit_message_text(
+
+            settings_text(),
+
+            call.message.chat.id,
+
             call.message.message_id,
-            reply_markup=settings_keyboard()
+
+            reply_markup=
+            settings_keyboard()
         )
 
     except Exception as e:
 
         print(
-            "Callback error:",
+            "Settings edit error:",
             e
         )
-
-        try:
-
-            bot.answer_callback_query(
-                call.id,
-                "❌ خطا"
-            )
-
-        except:
-            pass
 
 
 # =========================================================
@@ -1687,52 +1861,65 @@ def callbacks(call):
 def auto_loop():
 
     print(
-        "🦈 MEME HUNTER V9 AUTO STARTED"
+        "🦈 MEME HUNTER V9 AUTO LOOP STARTED"
     )
 
     while True:
 
         try:
 
-            if state["settings"][
-                "auto_hunter"
-            ]:
+            daily_reset()
 
-                monitor_positions()
+            s = state["settings"]
 
-                candidates = scan_market()
+            if s["auto_hunter"]:
 
-                for item in candidates:
+                if not s["emergency_stop"]:
 
-                    if item["opened"]:
+                    monitor_positions()
 
-                        info = item["info"]
+                    if s["paper_trading"]:
 
-                        notify(
-
-                            "🚨 🦈 PAPER BUY V9\n\n"
-
-                            f"🪙 {info['name']}\n"
-
-                            f"⭐ Score: "
-                            f"{item['score']}/100\n"
-
-                            f"💵 Price: "
-                            f"${info['price']:.10f}\n"
-
-                            f"💧 Liquidity: "
-                            f"${info['liquidity']:,.2f}\n"
-
-                            f"🟢 Buy Pressure: "
-                            f"{info['buy_pressure']*100:.0f}%\n\n"
-
-                            "🧪 Paper Trading"
+                        candidates = (
+                            scan_market()
                         )
+
+                        for (
+                            score,
+                            info
+                        ) in candidates:
+
+                            if paper_buy(
+                                info,
+                                score
+                            ):
+
+                                notify(
+
+                                    "🚨 🦈 AUTO PAPER BUY\n\n"
+
+                                    f"🪙 {info['name']}\n"
+
+                                    f"⭐ Score: "
+                                    f"{score}/100\n"
+
+                                    f"💵 Price: "
+                                    f"${info['price']:.10f}\n"
+
+                                    f"💧 Liquidity: "
+                                    f"${info['liquidity']:,.2f}\n"
+
+                                    f"🟢 Buy Pressure: "
+                                    f"{info['buy_pressure']*100:.0f}%\n"
+
+                                    f"💵 Size: "
+                                    f"${s['trade_size']:.2f}"
+                                )
 
         except Exception as e:
 
             print(
-                "Auto Hunter error:",
+                "Auto loop error:",
                 e
             )
 
@@ -1751,7 +1938,9 @@ threading.Thread(
 ).start()
 
 print(
-    "🦈 MEME HUNTER V9 FINAL RUNNING..."
+    "🦈 MEME HUNTER V9 RUNNING..."
 )
 
-bot.infinity_polling()
+bot.infinity_polling(
+    skip_pending=True
+)
