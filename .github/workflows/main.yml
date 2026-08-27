@@ -1,6 +1,7 @@
 - name: Run bot
   env:
-    BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-    PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
-    LIVE_TRADING: "true"
+  BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+  PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
+  LIVE_TRADING: "true"
+  RPC_URL: ${{ secrets.RPC_URL }}
   run: python bot.py
