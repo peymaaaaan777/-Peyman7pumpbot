@@ -29,6 +29,8 @@ jobs:
       - name: Run bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
+          LIVE_TRADING: "false"
           STARTING_BALANCE: "3.5015"
         run: |
           python bot.py
