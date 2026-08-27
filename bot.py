@@ -1,6 +1,6 @@
 import os
+import json
 import time
-import threading
 import requests
 import telebot
 
@@ -12,281 +12,254 @@ if not TOKEN:
 bot = telebot.TeleBot(TOKEN)
 
 API = "https://api.geckoterminal.com/api/v2/networks/solana/new_pools"
-
-# -----------------------------
-# Paper Trading Settings
-# -----------------------------
+STATE_FILE = "paper_state.json"
 
 START_BALANCE = 5.0
-RISK_PER_TRADE = 0.50
+TRADE_SIZE = 0.50
+
 TAKE_PROFIT = 0.20
 STOP_LOSS = 0.10
 
-paper_balance = START_BALANCE
-trades = []
-open_positions = {}
-
-last_scan = 0
+MIN_LIQUIDITY = 10000
+MIN_VOLUME = 5000
+MIN_SCORE = 70
 
 
-# -----------------------------
-# API
-# -----------------------------
+def load_state():
+    if not os.path.exists(STATE_FILE):
+        return {
+            "balance": START_BALANCE,
+            "trades": [],
+            "open": {}
+        }
 
-def get_new_pools():
-
-    headers = {
-        "Accept": "application/json;version=20230203"
-    }
-
-    response = requests.get(
-        API,
-        headers=headers,
-        timeout=20
-    )
-
-    response.raise_for_status()
-
-    data = response.json()
-
-    return data.get("data", [])
+    try:
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    except:
+        return {
+            "balance": START_BALANCE,
+            "trades": [],
+            "open": {}
+        }
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
+def save_state():
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
 
-def number(value):
 
+state = load_state()
+
+
+def num(value):
     try:
         return float(value or 0)
     except:
         return 0.0
 
 
-def pool_info(pool):
+def get_pools():
 
-    attrs = pool.get("attributes", {})
-    relationships = pool.get("relationships", {})
+    headers = {
+        "Accept": "application/json;version=20230203"
+    }
 
-    name = attrs.get("name", "Unknown")
-
-    price = number(
-        attrs.get("base_token_price_usd")
+    r = requests.get(
+        API,
+        headers=headers,
+        timeout=20
     )
 
-    liquidity = number(
-        attrs.get("reserve_in_usd")
+    r.raise_for_status()
+
+    return r.json().get("data", [])
+
+
+def get_info(pool):
+
+    a = pool.get("attributes", {})
+
+    price = num(
+        a.get("base_token_price_usd")
     )
 
-    volume = number(
-        attrs.get("volume_usd", {}).get("h24")
+    liquidity = num(
+        a.get("reserve_in_usd")
     )
 
-    txns = attrs.get("transactions", {}).get("h24", {})
-
-    buys = int(
-        txns.get("buys", 0) or 0
+    volume = num(
+        a.get("volume_usd", {}).get("h24")
     )
 
-    sells = int(
-        txns.get("sells", 0) or 0
+    tx = a.get("transactions", {}).get(
+        "h24", {}
     )
 
-    address = pool.get("id", "")
+    buys = int(tx.get("buys", 0) or 0)
+    sells = int(tx.get("sells", 0) or 0)
 
     return {
-        "name": name,
+        "id": pool.get("id", ""),
+        "name": a.get("name", "Unknown"),
         "price": price,
         "liquidity": liquidity,
         "volume": volume,
         "buys": buys,
-        "sells": sells,
-        "address": address,
-        "relationships": relationships
+        "sells": sells
     }
 
 
-# -----------------------------
-# Scoring
-# -----------------------------
+def score(x):
 
-def score_pool(info):
+    liquidity = x["liquidity"]
+    volume = x["volume"]
 
-    liquidity = info["liquidity"]
-    volume = info["volume"]
-    buys = info["buys"]
-    sells = info["sells"]
+    buys = x["buys"]
+    sells = x["sells"]
 
-    score = 0
+    total = buys + sells
 
-    # Liquidity
+    points = 0
+
     if liquidity >= 100000:
-        score += 30
+        points += 30
     elif liquidity >= 50000:
-        score += 25
+        points += 25
     elif liquidity >= 20000:
-        score += 18
-    elif liquidity >= 10000:
-        score += 10
+        points += 20
+    elif liquidity >= MIN_LIQUIDITY:
+        points += 10
     else:
         return 0
 
-    # Volume
     if volume >= 100000:
-        score += 30
+        points += 30
     elif volume >= 50000:
-        score += 25
+        points += 25
     elif volume >= 20000:
-        score += 18
-    elif volume >= 5000:
-        score += 10
+        points += 20
+    elif volume >= MIN_VOLUME:
+        points += 10
+    else:
+        return 0
 
-    # Buy pressure
-    total = buys + sells
+    if total:
 
-    if total > 0:
+        buy_ratio = buys / total
 
-        ratio = buys / total
+        if buy_ratio >= 0.70:
+            points += 30
+        elif buy_ratio >= 0.60:
+            points += 20
+        elif buy_ratio >= 0.55:
+            points += 10
 
-        if ratio >= 0.70:
-            score += 30
-        elif ratio >= 0.60:
-            score += 22
-        elif ratio >= 0.55:
-            score += 12
-
-    # Activity
     if total >= 500:
-        score += 10
+        points += 10
     elif total >= 200:
-        score += 7
+        points += 7
     elif total >= 100:
-        score += 4
+        points += 4
 
-    return min(score, 100)
+    return min(points, 100)
 
 
-# -----------------------------
-# Paper Entry
-# -----------------------------
+def open_paper_trade(x, s):
 
-def paper_entry(info, score):
+    address = x["id"]
 
-    global paper_balance
-
-    address = info["address"]
-
-    if address in open_positions:
+    if address in state["open"]:
         return False
 
-    if score < 70:
+    if s < MIN_SCORE:
         return False
 
-    if info["price"] <= 0:
+    if x["price"] <= 0:
         return False
 
-    if paper_balance < RISK_PER_TRADE:
+    if state["balance"] < TRADE_SIZE:
         return False
 
-    position = {
-        "name": info["name"],
-        "address": address,
-        "entry": info["price"],
-        "size": RISK_PER_TRADE,
-        "tp": info["price"] * (1 + TAKE_PROFIT),
-        "sl": info["price"] * (1 - STOP_LOSS),
-        "score": score,
-        "opened": time.time()
+    state["balance"] -= TRADE_SIZE
+
+    state["open"][address] = {
+        "name": x["name"],
+        "entry": x["price"],
+        "size": TRADE_SIZE,
+        "tp": x["price"] * (1 + TAKE_PROFIT),
+        "sl": x["price"] * (1 - STOP_LOSS),
+        "score": s,
+        "time": time.time()
     }
 
-    paper_balance -= RISK_PER_TRADE
-
-    open_positions[address] = position
+    save_state()
 
     return True
 
 
-# -----------------------------
-# Check positions
-# -----------------------------
+def update_trade(x):
 
-def check_position(info):
+    address = x["id"]
 
-    global paper_balance
-
-    address = info["address"]
-
-    if address not in open_positions:
+    if address not in state["open"]:
         return None
 
-    position = open_positions[address]
+    trade = state["open"][address]
 
-    price = info["price"]
+    price = x["price"]
 
     if price <= 0:
         return None
 
     result = None
 
-    if price >= position["tp"]:
+    if price >= trade["tp"]:
 
-        pnl = position["size"] * TAKE_PROFIT
+        pnl = trade["size"] * TAKE_PROFIT
+        result = "TP"
 
-        paper_balance += position["size"] + pnl
+    elif price <= trade["sl"]:
 
-        result = ("TP", pnl)
+        pnl = -trade["size"] * STOP_LOSS
+        result = "SL"
 
-    elif price <= position["sl"]:
+    else:
+        return None
 
-        pnl = -position["size"] * STOP_LOSS
+    state["balance"] += (
+        trade["size"] + pnl
+    )
 
-        paper_balance += position["size"] + pnl
+    state["trades"].append({
+        "name": trade["name"],
+        "entry": trade["entry"],
+        "exit": price,
+        "pnl": pnl,
+        "result": result,
+        "score": trade["score"],
+        "time": time.time()
+    })
 
-        result = ("SL", pnl)
+    del state["open"][address]
 
-    if result:
+    save_state()
 
-        trades.append({
-            "name": position["name"],
-            "entry": position["entry"],
-            "exit": price,
-            "pnl": result[1],
-            "result": result[0],
-            "score": position["score"]
-        })
-
-        del open_positions[address]
-
-    return result
+    return result, pnl
 
 
-# -----------------------------
-# Scan
-# -----------------------------
+def hunt():
 
-def perform_scan():
-
-    global last_scan
-
-    now = time.time()
-
-    if now - last_scan < 70:
-        return None, "⏳ کمی صبر کن؛ API هنوز در cooldown است."
-
-    last_scan = now
-
-    pools = get_new_pools()
+    pools = get_pools()
 
     candidates = []
 
     for pool in pools:
 
-        info = pool_info(pool)
+        x = get_info(pool)
 
-        name_upper = info["name"].upper()
+        name = x["name"].upper()
 
-        # Ignore obvious major-token pools
         blocked = [
             "SOL /",
             "SOL/",
@@ -295,42 +268,43 @@ def perform_scan():
             "USDT"
         ]
 
-        if any(x in name_upper for x in blocked):
+        if any(b in name for b in blocked):
             continue
 
-        score = score_pool(info)
+        s = score(x)
 
-        if score >= 50:
+        if s >= 50:
 
-            check_position(info)
+            closed = update_trade(x)
 
-            paper_entry(info, score)
+            opened = False
+
+            if s >= MIN_SCORE:
+                opened = open_paper_trade(
+                    x, s
+                )
 
             candidates.append(
-                (score, info)
+                (s, x, opened, closed)
             )
 
     candidates.sort(
-        key=lambda x: x[0],
+        key=lambda z: z[0],
         reverse=True
     )
 
-    return candidates[:5], None
+    return candidates[:5]
 
-
-# -----------------------------
-# Telegram
-# -----------------------------
 
 @bot.message_handler(commands=["start"])
 def start(message):
 
     bot.reply_to(
         message,
-        "🦈 Paper Meme Hunter v2 فعال شد!\n\n"
-        "/hunt = شکار جدید\n"
-        "/paper = وضعیت معاملات فرضی\n"
-        "/status = وضعیت ربات"
+        "🦈 Hunter v3 فعال شد!\n\n"
+        "/hunt = اسکن بازار\n"
+        "/paper = آمار معاملات\n"
+        "/status = وضعیت"
     )
 
 
@@ -339,80 +313,72 @@ def status(message):
 
     bot.reply_to(
         message,
-        "🟢 آنلاین\n"
+        "🟢 Hunter آنلاین است\n"
         "🧪 Paper Trading: فعال\n"
-        "💰 معامله واقعی: خاموش\n"
-        f"💵 Paper Balance: ${paper_balance:.2f}\n"
-        f"📂 Open Positions: {len(open_positions)}"
+        "💰 Real Trading: خاموش\n"
+        f"💵 Balance: ${state['balance']:.2f}\n"
+        f"📂 Open: {len(state['open'])}"
     )
 
 
 @bot.message_handler(commands=["hunt"])
-def hunt(message):
-
-    bot.send_message(
-        message.chat.id,
-        "🦈 در حال اسکن New Pools سولانا..."
-    )
+def hunt_command(message):
 
     try:
 
-        candidates, error = perform_scan()
+        bot.send_message(
+            message.chat.id,
+            "🦈 در حال شکار..."
+        )
 
-        if error:
+        results = hunt()
 
-            bot.send_message(
-                message.chat.id,
-                error
-            )
-            return
-
-        if not candidates:
+        if not results:
 
             bot.send_message(
                 message.chat.id,
-                "🔎 فعلاً شکار مناسبی پیدا نشد."
+                "🔎 فعلاً فرصت مناسبی پیدا نشد."
             )
             return
 
-        text = "🦈 بهترین شکارهای جدید:\n\n"
+        text = "🦈 شکارهای برتر:\n\n"
 
-        for i, (score, info) in enumerate(
-            candidates,
+        for i, (s, x, opened, closed) in enumerate(
+            results,
             1
         ):
 
-            total = info["buys"] + info["sells"]
+            total = x["buys"] + x["sells"]
 
-            buy_ratio = 0
-
-            if total:
-                buy_ratio = (
-                    info["buys"] / total
-                ) * 100
-
-            text += (
-                f"#{i} 🪙 {info['name']}\n"
-                f"⭐ Score: {score}/100\n"
-                f"💵 Price: ${info['price']:.10f}\n"
-                f"💧 Liquidity: "
-                f"${info['liquidity']:,.0f}\n"
-                f"📊 Volume: "
-                f"${info['volume']:,.0f}\n"
-                f"🟢 Buy ratio: "
-                f"{buy_ratio:.0f}%\n"
+            ratio = (
+                x["buys"] / total * 100
+                if total else 0
             )
 
-            if info["address"] in open_positions:
-                text += "🧪 PAPER ENTRY: OPEN\n"
-            else:
-                text += "👀 WATCHING\n"
+            text += (
+                f"#{i} 🪙 {x['name']}\n"
+                f"⭐ Score: {s}/100\n"
+                f"💵 ${x['price']:.10f}\n"
+                f"💧 ${x['liquidity']:,.0f}\n"
+                f"📊 ${x['volume']:,.0f}\n"
+                f"🟢 Buys: {ratio:.0f}%\n"
+            )
+
+            if opened:
+                text += "🧪 PAPER BUY: OPEN\n"
+
+            if closed:
+                text += (
+                    f"📤 CLOSED: "
+                    f"{closed[0]} "
+                    f"${closed[1]:+.4f}\n"
+                )
 
             text += "\n"
 
         text += (
-            "🧪 Paper Trading فعال است.\n"
-            "⚠️ هیچ معامله واقعی انجام نمی‌شود."
+            "🧪 Paper Trading\n"
+            "⚠️ معامله واقعی خاموش است."
         )
 
         bot.send_message(
@@ -431,9 +397,7 @@ def hunt(message):
 @bot.message_handler(commands=["paper"])
 def paper(message):
 
-    total_pnl = sum(
-        t["pnl"] for t in trades
-    )
+    trades = state["trades"]
 
     wins = sum(
         1 for t in trades
@@ -445,36 +409,30 @@ def paper(message):
         if t["pnl"] < 0
     )
 
-    total = wins + losses
+    pnl = sum(
+        t["pnl"] for t in trades
+    )
+
+    total = len(trades)
 
     win_rate = (
         wins / total * 100
         if total else 0
     )
 
-    text = (
+    bot.reply_to(
+        message,
         "📊 PAPER TRADING\n\n"
-        f"💵 Balance: ${paper_balance:.2f}\n"
-        f"📂 Open: {len(open_positions)}\n"
+        f"💵 Balance: ${state['balance']:.2f}\n"
+        f"📂 Open: {len(state['open'])}\n"
+        f"🔢 Closed: {total}\n"
         f"✅ Wins: {wins}\n"
         f"❌ Losses: {losses}\n"
         f"🎯 Win rate: {win_rate:.1f}%\n"
-        f"💰 Total PnL: ${total_pnl:.4f}\n"
-        f"🔢 Closed trades: {total}\n"
-    )
-
-    bot.reply_to(
-        message,
-        text
+        f"💰 PnL: ${pnl:+.4f}"
     )
 
 
-# -----------------------------
-# Run
-# -----------------------------
-
-print(
-    "🦈 Paper Meme Hunter v2 running..."
-)
+print("🦈 Hunter v3 running...")
 
 bot.infinity_polling()
