@@ -20,46 +20,58 @@ TRADE_SIZE = 0.50
 TAKE_PROFIT = 0.20
 STOP_LOSS = 0.10
 
-MIN_SCORE = 60
+# فیلتر شکار
+MIN_SCORE = 70
+MIN_BUY_PRESSURE = 0.60
+MIN_M5_VOLUME = 100
+
+
+def default_state():
+    return {
+        "balance": START_BALANCE,
+        "trades": [],
+        "open": {}
+    }
 
 
 def load_state():
+
     if not os.path.exists(STATE_FILE):
-        return {
-            "balance": START_BALANCE,
-            "trades": [],
-            "open": {}
-        }
+        return default_state()
 
     try:
         with open(STATE_FILE, "r") as f:
             return json.load(f)
-    except:
-        return {
-            "balance": START_BALANCE,
-            "trades": [],
-            "open": {}
-        }
+
+    except Exception:
+        return default_state()
 
 
 state = load_state()
 
 
 def save_state():
+
     with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+        json.dump(
+            state,
+            f,
+            indent=2
+        )
 
 
-def num(x):
+def num(value):
+
     try:
-        return float(x or 0)
-    except:
+        return float(value or 0)
+
+    except Exception:
         return 0.0
 
 
 def get_pools():
 
-    r = requests.get(
+    response = requests.get(
         API,
         headers={
             "Accept": "application/json"
@@ -67,25 +79,49 @@ def get_pools():
         timeout=20
     )
 
-    r.raise_for_status()
+    response.raise_for_status()
 
-    return r.json().get("data", [])
+    return response.json().get(
+        "data",
+        []
+    )
 
 
 def parse_pool(pool):
 
-    a = pool.get("attributes", {})
+    attrs = pool.get(
+        "attributes",
+        {}
+    )
 
-    tx = a.get("transactions", {})
-    vol = a.get("volume_usd", {})
+    transactions = attrs.get(
+        "transactions",
+        {}
+    )
 
-    m5_tx = tx.get("m5", {})
-    m5_vol = num(vol.get("m5"))
+    volumes = attrs.get(
+        "volume_usd",
+        {}
+    )
 
-    h24_vol = num(vol.get("h24"))
+    m5_transactions = transactions.get(
+        "m5",
+        {}
+    )
 
-    buys = int(m5_tx.get("buys", 0) or 0)
-    sells = int(m5_tx.get("sells", 0) or 0)
+    buys = int(
+        m5_transactions.get(
+            "buys",
+            0
+        ) or 0
+    )
+
+    sells = int(
+        m5_transactions.get(
+            "sells",
+            0
+        ) or 0
+    )
 
     total = buys + sells
 
@@ -96,71 +132,134 @@ def parse_pool(pool):
     )
 
     return {
-        "id": pool.get("id", ""),
-        "address": a.get("address", ""),
-        "name": a.get("name", "Unknown"),
-        "price": num(a.get("base_token_price_usd")),
-        "fdv": num(a.get("fdv_usd")),
-        "liquidity": num(a.get("reserve_in_usd")),
-        "m5_volume": m5_vol,
-        "h24_volume": h24_vol,
+
+        "id": pool.get(
+            "id",
+            ""
+        ),
+
+        "address": attrs.get(
+            "address",
+            ""
+        ),
+
+        "name": attrs.get(
+            "name",
+            "Unknown"
+        ),
+
+        "price": num(
+            attrs.get(
+                "base_token_price_usd"
+            )
+        ),
+
+        "fdv": num(
+            attrs.get(
+                "fdv_usd"
+            )
+        ),
+
+        "liquidity": num(
+            attrs.get(
+                "reserve_in_usd"
+            )
+        ),
+
+        "m5_volume": num(
+            volumes.get(
+                "m5"
+            )
+        ),
+
+        "h24_volume": num(
+            volumes.get(
+                "h24"
+            )
+        ),
+
         "buys": buys,
+
         "sells": sells,
+
         "buy_ratio": buy_ratio,
-        "created": a.get("pool_created_at", "")
+
+        "created": attrs.get(
+            "pool_created_at",
+            ""
+        )
     }
 
 
-def score(x):
+def score_pool(x):
 
-    points = 0
+    score = 0
 
     # حجم 5 دقیقه
-    if x["m5_volume"] >= 1000:
-        points += 25
+    if x["m5_volume"] >= 10000:
+        score += 25
+
+    elif x["m5_volume"] >= 1000:
+        score += 20
+
     elif x["m5_volume"] >= 250:
-        points += 18
-    elif x["m5_volume"] >= 50:
-        points += 10
-    elif x["m5_volume"] >= 10:
-        points += 5
+        score += 15
+
+    elif x["m5_volume"] >= 100:
+        score += 8
 
     # تعداد معاملات
-    total = x["buys"] + x["sells"]
+    total = (
+        x["buys"] +
+        x["sells"]
+    )
 
-    if total >= 20:
-        points += 20
+    if total >= 100:
+        score += 20
+
+    elif total >= 50:
+        score += 15
+
+    elif total >= 20:
+        score += 10
+
     elif total >= 10:
-        points += 15
-    elif total >= 5:
-        points += 10
-    elif total >= 2:
-        points += 5
+        score += 5
 
     # فشار خرید
     if x["buy_ratio"] >= 0.75:
-        points += 30
+        score += 35
+
     elif x["buy_ratio"] >= 0.65:
-        points += 22
+        score += 28
+
+    elif x["buy_ratio"] >= 0.60:
+        score += 20
+
     elif x["buy_ratio"] >= 0.55:
-        points += 12
+        score += 10
 
     # حجم 24 ساعت
     if x["h24_volume"] >= 100000:
-        points += 15
+        score += 10
+
     elif x["h24_volume"] >= 10000:
-        points += 10
+        score += 7
+
     elif x["h24_volume"] >= 1000:
-        points += 5
+        score += 4
 
-    # FDV خیلی پایین = ریسک بیشتر
+    # FDV
     if x["fdv"] >= 10000:
-        points += 5
+        score += 5
 
-    return min(points, 100)
+    return min(
+        score,
+        100
+    )
 
 
-def open_trade(x, s):
+def open_paper_trade(x, score):
 
     address = x["address"]
 
@@ -170,7 +269,16 @@ def open_trade(x, s):
     if address in state["open"]:
         return False
 
-    if s < MIN_SCORE:
+    # امتیاز حداقل
+    if score < MIN_SCORE:
+        return False
+
+    # فشار خرید حداقل 60 درصد
+    if x["buy_ratio"] < MIN_BUY_PRESSURE:
+        return False
+
+    # حجم 5 دقیقه حداقل
+    if x["m5_volume"] < MIN_M5_VOLUME:
         return False
 
     if x["price"] <= 0:
@@ -182,13 +290,29 @@ def open_trade(x, s):
     state["balance"] -= TRADE_SIZE
 
     state["open"][address] = {
+
         "name": x["name"],
+
         "address": address,
+
         "entry": x["price"],
+
         "size": TRADE_SIZE,
-        "tp": x["price"] * (1 + TAKE_PROFIT),
-        "sl": x["price"] * (1 - STOP_LOSS),
-        "score": s,
+
+        "tp": (
+            x["price"] *
+            (1 + TAKE_PROFIT)
+        ),
+
+        "sl": (
+            x["price"] *
+            (1 - STOP_LOSS)
+        ),
+
+        "score": score,
+
+        "buy_ratio": x["buy_ratio"],
+
         "opened": time.time()
     }
 
@@ -211,30 +335,51 @@ def update_trade(x):
     if price <= 0:
         return None
 
+    result = None
+    pnl = 0
+
     if price >= trade["tp"]:
 
-        pnl = trade["size"] * TAKE_PROFIT
+        pnl = (
+            trade["size"] *
+            TAKE_PROFIT
+        )
+
         result = "TP"
 
     elif price <= trade["sl"]:
 
-        pnl = -trade["size"] * STOP_LOSS
+        pnl = -(
+            trade["size"] *
+            STOP_LOSS
+        )
+
         result = "SL"
 
     else:
         return None
 
     state["balance"] += (
-        trade["size"] + pnl
+        trade["size"] +
+        pnl
     )
 
     state["trades"].append({
+
         "name": trade["name"],
+
         "entry": trade["entry"],
+
         "exit": price,
+
         "pnl": pnl,
+
         "result": result,
+
         "score": trade["score"],
+
+        "opened": trade["opened"],
+
         "closed": time.time()
     })
 
@@ -245,7 +390,7 @@ def update_trade(x):
     return result, pnl
 
 
-def scan():
+def scan_market():
 
     pools = get_pools()
 
@@ -257,92 +402,129 @@ def scan():
 
         name = x["name"].upper()
 
-        # فقط جفت‌هایی که SOL دارند
+        # فقط جفت‌های سولانا
         if "SOL" not in name:
             continue
 
-        # استیبل‌کوین‌ها را حذف کن
-        blocked = [
-            "USDC",
-            "USDT"
-        ]
-
-        if any(b in name for b in blocked):
+        # حذف استیبل‌کوین‌ها
+        if (
+            "USDC" in name or
+            "USDT" in name
+        ):
             continue
 
         closed = update_trade(x)
 
-        s = score(x)
+        score = score_pool(x)
 
         opened = False
 
-        if s >= MIN_SCORE:
-            opened = open_trade(x, s)
+        if score >= MIN_SCORE:
 
-        if s >= 30:
+            opened = open_paper_trade(
+                x,
+                score
+            )
+
+        if score >= 40:
 
             candidates.append({
-                "score": s,
+
+                "score": score,
+
                 "data": x,
+
                 "opened": opened,
+
                 "closed": closed
             })
 
     candidates.sort(
-        key=lambda z: z["score"],
+        key=lambda item:
+        item["score"],
         reverse=True
     )
 
     return candidates[:5]
 
 
-@bot.message_handler(commands=["start"])
+@bot.message_handler(
+    commands=["start"]
+)
 def start(message):
 
     bot.reply_to(
+
         message,
-        "🦈 Hunter v4 فعال شد!\n\n"
-        "/hunt = شکار\n"
-        "/paper = آمار\n"
-        "/status = وضعیت"
+
+        "🦈 Hunter v5 فعال شد!\n\n"
+
+        "/hunt = شکار جدید\n"
+
+        "/paper = آمار Paper Trading\n"
+
+        "/status = وضعیت ربات"
     )
 
 
-@bot.message_handler(commands=["status"])
+@bot.message_handler(
+    commands=["status"]
+)
 def status(message):
 
     bot.reply_to(
+
         message,
-        "🟢 ربات آنلاین\n"
+
+        "🟢 ربات آنلاین است\n\n"
+
+        "🦈 Hunter: فعال\n"
+
         "🧪 Paper Trading: فعال\n"
+
         "💰 Real Trading: خاموش\n\n"
-        f"💵 Balance: ${state['balance']:.2f}\n"
-        f"📂 Open: {len(state['open'])}\n"
-        f"🔢 Closed: {len(state['trades'])}"
+
+        f"💵 Balance: "
+        f"${state['balance']:.2f}\n"
+
+        f"📂 Open: "
+        f"{len(state['open'])}\n"
+
+        f"🔢 Closed: "
+        f"{len(state['trades'])}"
     )
 
 
-@bot.message_handler(commands=["hunt"])
+@bot.message_handler(
+    commands=["hunt"]
+)
 def hunt(message):
 
     try:
 
         bot.send_message(
+
             message.chat.id,
-            "🦈 در حال شکار توکن‌های تازه..."
+
+            "🦈 در حال شکار میم‌کوین‌های سولانا..."
         )
 
-        results = scan()
+        results = scan_market()
 
         if not results:
 
             bot.send_message(
+
                 message.chat.id,
-                "🔎 فعلاً داده کافی برای شکار پیدا نشد."
+
+                "🔎 فعلاً فرصت مناسبی پیدا نشد."
             )
+
             return
 
-        text = "🦈 TOP HUNTS\n\n"
+        text = (
+            "🦈 TOP HUNTS\n\n"
+        )
 
         for i, item in enumerate(
             results,
@@ -352,86 +534,156 @@ def hunt(message):
             x = item["data"]
 
             text += (
-                f"#{i} 🪙 {x['name']}\n"
-                f"⭐ Score: {item['score']}/100\n"
-                f"💵 Price: ${x['price']:.10f}\n"
-                f"📊 M5 Volume: ${x['m5_volume']:.2f}\n"
-                f"🛒 Buys: {x['buys']}\n"
-                f"📉 Sells: {x['sells']}\n"
+
+                f"#{i} 🪙 "
+                f"{x['name']}\n"
+
+                f"⭐ Score: "
+                f"{item['score']}/100\n"
+
+                f"💵 Price: "
+                f"${x['price']:.10f}\n"
+
+                f"📊 M5 Volume: "
+                f"${x['m5_volume']:,.2f}\n"
+
+                f"🛒 Buys: "
+                f"{x['buys']}\n"
+
+                f"📉 Sells: "
+                f"{x['sells']}\n"
+
                 f"🟢 Buy pressure: "
                 f"{x['buy_ratio']*100:.0f}%\n"
             )
 
             if item["opened"]:
-                text += "🧪 PAPER BUY: OPEN\n"
+
+                text += (
+                    "🧪 PAPER BUY: OPEN\n"
+                )
+
+            elif (
+                item["score"] >= MIN_SCORE
+            ):
+
+                text += (
+                    "⏸️ شرایط خرید "
+                    "کامل نبود\n"
+                )
 
             if item["closed"]:
+
                 text += (
+
                     f"📤 CLOSED: "
                     f"{item['closed'][0]} "
+
                     f"${item['closed'][1]:+.4f}\n"
                 )
 
             text += "\n"
 
         text += (
+
             "🧪 Paper Trading فعال\n"
+
+            "🎯 حداقل Score: "
+            f"{MIN_SCORE}\n"
+
+            "🟢 حداقل Buy pressure: "
+            f"{MIN_BUY_PRESSURE*100:.0f}%\n\n"
+
             "⚠️ معامله واقعی خاموش است."
         )
 
         bot.send_message(
+
             message.chat.id,
+
             text
         )
 
     except Exception as e:
 
         bot.send_message(
+
             message.chat.id,
+
             f"❌ خطا:\n{e}"
         )
 
 
-@bot.message_handler(commands=["paper"])
+@bot.message_handler(
+    commands=["paper"]
+)
 def paper(message):
 
     trades = state["trades"]
 
     wins = sum(
-        1 for t in trades
-        if t["pnl"] > 0
+
+        1 for trade in trades
+
+        if trade["pnl"] > 0
     )
 
     losses = sum(
-        1 for t in trades
-        if t["pnl"] < 0
+
+        1 for trade in trades
+
+        if trade["pnl"] < 0
     )
 
     pnl = sum(
-        t["pnl"] for t in trades
+
+        trade["pnl"]
+
+        for trade in trades
     )
 
     total = len(trades)
 
     win_rate = (
+
         wins / total * 100
+
         if total
+
         else 0
     )
 
     bot.reply_to(
+
         message,
+
         "📊 PAPER TRADING\n\n"
-        f"💵 Balance: ${state['balance']:.2f}\n"
-        f"📂 Open: {len(state['open'])}\n"
-        f"🔢 Closed: {total}\n"
-        f"✅ Wins: {wins}\n"
-        f"❌ Losses: {losses}\n"
-        f"🎯 Win rate: {win_rate:.1f}%\n"
-        f"💰 PnL: ${pnl:+.4f}"
+
+        f"💵 Balance: "
+        f"${state['balance']:.2f}\n"
+
+        f"📂 Open: "
+        f"{len(state['open'])}\n"
+
+        f"🔢 Closed: "
+        f"{total}\n"
+
+        f"✅ Wins: "
+        f"{wins}\n"
+
+        f"❌ Losses: "
+        f"{losses}\n"
+
+        f"🎯 Win rate: "
+        f"{win_rate:.1f}%\n"
+
+        f"💰 PnL: "
+        f"${pnl:+.4f}"
     )
 
 
-print("🦈 Hunter v4 running...")
+print(
+    "🦈 Hunter v5 running..."
+)
 
 bot.infinity_polling()
