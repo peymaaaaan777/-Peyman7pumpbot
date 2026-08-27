@@ -1,4 +1,4 @@
-import os
+LIVE_TRADING = os.getenv("LIVE_TRADING", "0") == "1"import os
 import time
 import json
 import threading
