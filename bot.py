@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import threading
 import requests
 import telebot
 
@@ -20,10 +21,13 @@ TRADE_SIZE = 0.50
 TAKE_PROFIT = 0.20
 STOP_LOSS = 0.10
 
-# فیلتر شکار
 MIN_SCORE = 70
 MIN_BUY_PRESSURE = 0.60
 MIN_M5_VOLUME = 100
+
+AUTO_SCAN_INTERVAL = 180
+
+CHAT_ID = None
 
 
 def default_state():
@@ -104,20 +108,20 @@ def parse_pool(pool):
         {}
     )
 
-    m5_transactions = transactions.get(
+    m5 = transactions.get(
         "m5",
         {}
     )
 
     buys = int(
-        m5_transactions.get(
+        m5.get(
             "buys",
             0
         ) or 0
     )
 
     sells = int(
-        m5_transactions.get(
+        m5.get(
             "sells",
             0
         ) or 0
@@ -195,25 +199,27 @@ def score_pool(x):
 
     score = 0
 
-    # حجم 5 دقیقه
-    if x["m5_volume"] >= 10000:
-        score += 25
+    volume = x["m5_volume"]
 
-    elif x["m5_volume"] >= 1000:
-        score += 20
-
-    elif x["m5_volume"] >= 250:
-        score += 15
-
-    elif x["m5_volume"] >= 100:
-        score += 8
-
-    # تعداد معاملات
     total = (
         x["buys"] +
         x["sells"]
     )
 
+    # M5 Volume
+    if volume >= 10000:
+        score += 25
+
+    elif volume >= 1000:
+        score += 20
+
+    elif volume >= 250:
+        score += 15
+
+    elif volume >= 100:
+        score += 8
+
+    # Activity
     if total >= 100:
         score += 20
 
@@ -226,7 +232,7 @@ def score_pool(x):
     elif total >= 10:
         score += 5
 
-    # فشار خرید
+    # Buy pressure
     if x["buy_ratio"] >= 0.75:
         score += 35
 
@@ -239,7 +245,7 @@ def score_pool(x):
     elif x["buy_ratio"] >= 0.55:
         score += 10
 
-    # حجم 24 ساعت
+    # 24h volume
     if x["h24_volume"] >= 100000:
         score += 10
 
@@ -269,15 +275,12 @@ def open_paper_trade(x, score):
     if address in state["open"]:
         return False
 
-    # امتیاز حداقل
     if score < MIN_SCORE:
         return False
 
-    # فشار خرید حداقل 60 درصد
     if x["buy_ratio"] < MIN_BUY_PRESSURE:
         return False
 
-    # حجم 5 دقیقه حداقل
     if x["m5_volume"] < MIN_M5_VOLUME:
         return False
 
@@ -402,11 +405,9 @@ def scan_market():
 
         name = x["name"].upper()
 
-        # فقط جفت‌های سولانا
         if "SOL" not in name:
             continue
 
-        # حذف استیبل‌کوین‌ها
         if (
             "USDC" in name or
             "USDT" in name
@@ -448,22 +449,128 @@ def scan_market():
     return candidates[:5]
 
 
+def send_auto_alert(results):
+
+    global CHAT_ID
+
+    if not CHAT_ID:
+        return
+
+    for item in results:
+
+        if not item["opened"]:
+            continue
+
+        x = item["data"]
+
+        message = (
+
+            "🚨 🦈 AUTO HUNTER\n\n"
+
+            f"🪙 {x['name']}\n"
+
+            f"⭐ Score: "
+            f"{item['score']}/100\n"
+
+            f"💵 Price: "
+            f"${x['price']:.10f}\n"
+
+            f"📊 M5 Volume: "
+            f"${x['m5_volume']:,.2f}\n"
+
+            f"🛒 Buys: "
+            f"{x['buys']}\n"
+
+            f"📉 Sells: "
+            f"{x['sells']}\n"
+
+            f"🟢 Buy pressure: "
+            f"{x['buy_ratio']*100:.0f}%\n\n"
+
+            "🧪 PAPER BUY OPEN\n"
+
+            f"💰 Size: ${TRADE_SIZE:.2f}\n"
+
+            f"🎯 TP: +{TAKE_PROFIT*100:.0f}%\n"
+
+            f"🛑 SL: -{STOP_LOSS*100:.0f}%"
+        )
+
+        try:
+
+            bot.send_message(
+                CHAT_ID,
+                message
+            )
+
+        except Exception as e:
+
+            print(
+                "Telegram error:",
+                e
+            )
+
+
+def auto_hunter():
+
+    print(
+        "🦈 Auto Hunter started"
+    )
+
+    while True:
+
+        try:
+
+            results = scan_market()
+
+            print(
+                "🔎 Auto scan:",
+                len(results),
+                "candidates"
+            )
+
+            send_auto_alert(
+                results
+            )
+
+        except Exception as e:
+
+            print(
+                "❌ Auto scan error:",
+                e
+            )
+
+        time.sleep(
+            AUTO_SCAN_INTERVAL
+        )
+
+
 @bot.message_handler(
     commands=["start"]
 )
 def start(message):
 
+    global CHAT_ID
+
+    CHAT_ID = message.chat.id
+
     bot.reply_to(
 
         message,
 
-        "🦈 Hunter v5 فعال شد!\n\n"
+        "🦈 Hunter v6 فعال شد!\n\n"
 
-        "/hunt = شکار جدید\n"
+        "🔄 Auto Scanner: فعال\n"
 
-        "/paper = آمار Paper Trading\n"
+        "🧪 Paper Trading: فعال\n"
 
-        "/status = وضعیت ربات"
+        "💰 Real Trading: خاموش\n\n"
+
+        "/hunt = شکار دستی\n"
+
+        "/paper = آمار\n"
+
+        "/status = وضعیت"
     )
 
 
@@ -472,13 +579,17 @@ def start(message):
 )
 def status(message):
 
+    global CHAT_ID
+
+    CHAT_ID = message.chat.id
+
     bot.reply_to(
 
         message,
 
         "🟢 ربات آنلاین است\n\n"
 
-        "🦈 Hunter: فعال\n"
+        "🦈 Auto Hunter: فعال\n"
 
         "🧪 Paper Trading: فعال\n"
 
@@ -500,13 +611,17 @@ def status(message):
 )
 def hunt(message):
 
+    global CHAT_ID
+
+    CHAT_ID = message.chat.id
+
     try:
 
         bot.send_message(
 
             message.chat.id,
 
-            "🦈 در حال شکار میم‌کوین‌های سولانا..."
+            "🦈 در حال شکار..."
         )
 
         results = scan_market()
@@ -563,36 +678,16 @@ def hunt(message):
                     "🧪 PAPER BUY: OPEN\n"
                 )
 
-            elif (
-                item["score"] >= MIN_SCORE
-            ):
-
-                text += (
-                    "⏸️ شرایط خرید "
-                    "کامل نبود\n"
-                )
-
-            if item["closed"]:
-
-                text += (
-
-                    f"📤 CLOSED: "
-                    f"{item['closed'][0]} "
-
-                    f"${item['closed'][1]:+.4f}\n"
-                )
-
             text += "\n"
 
         text += (
 
             "🧪 Paper Trading فعال\n"
 
-            "🎯 حداقل Score: "
-            f"{MIN_SCORE}\n"
+            f"🎯 Score >= {MIN_SCORE}\n"
 
-            "🟢 حداقل Buy pressure: "
-            f"{MIN_BUY_PRESSURE*100:.0f}%\n\n"
+            f"🟢 Buy pressure >= "
+            f"{MIN_BUY_PRESSURE*100:.0f}%\n"
 
             "⚠️ معامله واقعی خاموش است."
         )
@@ -622,24 +717,20 @@ def paper(message):
     trades = state["trades"]
 
     wins = sum(
-
-        1 for trade in trades
-
-        if trade["pnl"] > 0
+        1
+        for t in trades
+        if t["pnl"] > 0
     )
 
     losses = sum(
-
-        1 for trade in trades
-
-        if trade["pnl"] < 0
+        1
+        for t in trades
+        if t["pnl"] < 0
     )
 
     pnl = sum(
-
-        trade["pnl"]
-
-        for trade in trades
+        t["pnl"]
+        for t in trades
     )
 
     total = len(trades)
@@ -682,8 +773,14 @@ def paper(message):
     )
 
 
+threading.Thread(
+    target=auto_hunter,
+    daemon=True
+).start()
+
+
 print(
-    "🦈 Hunter v5 running..."
+    "🦈 Hunter v6 running..."
 )
 
 bot.infinity_polling()
