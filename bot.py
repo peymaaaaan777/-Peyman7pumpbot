@@ -7,13 +7,17 @@ import telebot
 from telebot import types
 
 # =========================================================
-# BASIC CONFIG
+# CONFIG
 # =========================================================
 
 TOKEN = os.getenv("BOT_TOKEN")
+JUPITER_API_KEY = os.getenv("JUPITER_API_KEY")
 
 if not TOKEN:
     raise ValueError("❌ BOT_TOKEN پیدا نشد")
+
+if not JUPITER_API_KEY:
+    print("⚠️ JUPITER_API_KEY پیدا نشد")
 
 bot = telebot.TeleBot(TOKEN)
 
@@ -27,14 +31,22 @@ POOL_API = (
     "networks/solana/pools/"
 )
 
+JUPITER_ORDER_API = (
+    "https://api.jup.ag/swap/v2/order"
+)
+
 STATE_FILE = "bot_state.json"
 
 START_BALANCE = 5.00
-
 SCAN_INTERVAL = 180
 
+# Native SOL mint
+SOL_MINT = (
+    "So11111111111111111111111111111111111111112"
+)
+
 # =========================================================
-# DEFAULT SETTINGS
+# SETTINGS
 # =========================================================
 
 DEFAULT_SETTINGS = {
@@ -48,7 +60,6 @@ DEFAULT_SETTINGS = {
     "paper_trading": True,
     "real_trading": False
 }
-
 
 # =========================================================
 # STATE
@@ -83,7 +94,6 @@ def load_state():
             data = json.load(f)
 
         result = default_state()
-
         result.update(data)
 
         for key, value in DEFAULT_SETTINGS.items():
@@ -128,18 +138,14 @@ def save_state():
 
 
 # =========================================================
-# API
+# HTTP
 # =========================================================
 
-def get_json(url):
-
-    headers = {
-        "Accept":
-        "application/json;version=20230203"
-    }
+def get_json(url, params=None, headers=None):
 
     response = requests.get(
         url,
+        params=params,
         headers=headers,
         timeout=20
     )
@@ -149,10 +155,20 @@ def get_json(url):
     return response.json()
 
 
+# =========================================================
+# GECKO
+# =========================================================
+
 def get_new_pools():
 
+    headers = {
+        "Accept":
+        "application/json;version=20230203"
+    }
+
     data = get_json(
-        NEW_POOLS_API
+        NEW_POOLS_API,
+        headers=headers
     )
 
     return data.get(
@@ -165,8 +181,14 @@ def get_pool(address):
 
     try:
 
+        headers = {
+            "Accept":
+            "application/json;version=20230203"
+        }
+
         data = get_json(
-            POOL_API + address
+            POOL_API + address,
+            headers=headers
         )
 
         return data.get(
@@ -181,6 +203,109 @@ def get_pool(address):
         )
 
         return None
+
+
+# =========================================================
+# JUPITER
+# =========================================================
+
+def jupiter_order(
+    output_mint,
+    amount_lamports
+):
+
+    if not JUPITER_API_KEY:
+
+        return {
+            "ok": False,
+            "error":
+            "JUPITER_API_KEY تنظیم نشده"
+        }
+
+    params = {
+
+        "inputMint":
+        SOL_MINT,
+
+        "outputMint":
+        output_mint,
+
+        "amount":
+        str(int(amount_lamports)),
+
+        "swapMode":
+        "ExactIn",
+
+        "slippageBps":
+        300
+    }
+
+    headers = {
+
+        "x-api-key":
+        JUPITER_API_KEY
+    }
+
+    try:
+
+        response = requests.get(
+
+            JUPITER_ORDER_API,
+
+            params=params,
+
+            headers=headers,
+
+            timeout=20
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        if data.get("error"):
+
+            return {
+                "ok": False,
+                "error":
+                data.get("errorMessage")
+                or data.get("error")
+            }
+
+        return {
+            "ok": True,
+            "data": data
+        }
+
+    except Exception as e:
+
+        return {
+            "ok": False,
+            "error": str(e)
+        }
+
+
+def test_jupiter_quote(info):
+
+    """
+    فقط quote می‌گیرد.
+    هیچ تراکنشی امضا یا اجرا نمی‌شود.
+    """
+
+    if not info["address"]:
+        return None
+
+    amount_lamports = int(
+        state["settings"]["trade_size"]
+        * 1_000_000_000
+    )
+
+    result = jupiter_order(
+        info["address"],
+        amount_lamports
+    )
+
+    return result
 
 
 # =========================================================
@@ -322,90 +447,62 @@ def calculate_score(info):
         info["sells"]
     )
 
-    pressure = (
-        info["buy_pressure"]
-    )
+    pressure = info["buy_pressure"]
 
     fdv = info["fdv"]
 
-    # Volume
-
     if volume >= 10000:
-
         score += 25
 
     elif volume >= 5000:
-
         score += 22
 
     elif volume >= 1000:
-
         score += 18
 
     elif volume >= 500:
-
         score += 12
 
     elif volume >= 100:
-
         score += 7
 
-    # Transactions
-
     if total >= 500:
-
         score += 20
 
     elif total >= 200:
-
         score += 17
 
     elif total >= 100:
-
         score += 14
 
     elif total >= 50:
-
         score += 10
 
     elif total >= 20:
-
         score += 6
 
-    # Buy pressure
-
     if pressure >= 0.80:
-
         score += 35
 
     elif pressure >= 0.70:
-
         score += 30
 
     elif pressure >= 0.65:
-
         score += 25
 
     elif pressure >= 0.60:
-
         score += 18
 
     elif pressure >= 0.55:
-
         score += 10
 
-    # FDV
-
     if fdv >= 100000:
-
         score += 5
 
     elif fdv >= 10000:
-
         score += 8
 
     elif fdv >= 5000:
-
         score += 5
 
     return min(
@@ -418,10 +515,7 @@ def calculate_score(info):
 # PAPER BUY
 # =========================================================
 
-def paper_buy(
-    info,
-    score
-):
+def paper_buy(info, score):
 
     settings = state["settings"]
 
@@ -494,7 +588,7 @@ def paper_buy(
 
 
 # =========================================================
-# CLOSE POSITION
+# CLOSE
 # =========================================================
 
 def close_position(
@@ -575,7 +669,7 @@ def close_position(
 
 
 # =========================================================
-# POSITION MONITOR
+# MONITOR
 # =========================================================
 
 def monitor_positions():
@@ -610,9 +704,7 @@ def monitor_positions():
             if not position:
                 continue
 
-            settings = (
-                state["settings"]
-            )
+            settings = state["settings"]
 
             tp = (
                 position["entry"]
@@ -683,7 +775,7 @@ def monitor_positions():
 
 
 # =========================================================
-# MARKET SCANNER
+# SCANNER
 # =========================================================
 
 def scan_market():
@@ -706,7 +798,6 @@ def scan_market():
             )
 
             blocked = [
-
                 "USDC",
                 "USDT",
                 "WSOL"
@@ -759,7 +850,7 @@ def scan_market():
 
 
 # =========================================================
-# TELEGRAM NOTIFY
+# NOTIFY
 # =========================================================
 
 def notify(text):
@@ -787,7 +878,7 @@ def notify(text):
 
 
 # =========================================================
-# SETTINGS DISPLAY
+# SETTINGS TEXT
 # =========================================================
 
 def settings_text():
@@ -830,25 +921,22 @@ def settings_text():
         f"{'🟢 ON' if s['paper_trading'] else '🔴 OFF'}\n"
 
         f"💰 Real Trading: "
-        f"{'🟢 ON' if s['real_trading'] else '🔴 OFF'}\n\n"
+        f"{'🟢 ON' if s['real_trading'] else '🔒 LOCKED'}\n\n"
 
         "🔐 WALLET\n"
         f"{wallet}\n\n"
 
-        "⚠️ Real Trading فقط وقتی مجاز است "
-        "که کیف پول به روش امن تأیید شده باشد."
+        "🛡️ Real Trading هنوز قفل است."
     )
 
 
 # =========================================================
-# SETTINGS KEYBOARD
+# KEYBOARD
 # =========================================================
 
 def settings_keyboard():
 
-    keyboard = (
-        types.InlineKeyboardMarkup()
-    )
+    keyboard = types.InlineKeyboardMarkup()
 
     keyboard.row(
 
@@ -934,6 +1022,14 @@ def settings_keyboard():
     keyboard.row(
 
         types.InlineKeyboardButton(
+            "🪐 Jupiter Test",
+            callback_data="jupiter_test"
+        )
+    )
+
+    keyboard.row(
+
+        types.InlineKeyboardButton(
             "💰 Real Trading",
             callback_data="real_toggle"
         )
@@ -959,9 +1055,7 @@ def settings_keyboard():
 )
 def start(message):
 
-    state["chat_id"] = (
-        message.chat.id
-    )
+    state["chat_id"] = message.chat.id
 
     save_state()
 
@@ -969,7 +1063,7 @@ def start(message):
 
         message,
 
-        "🦈 MEME HUNTER FINAL\n\n"
+        "🦈 MEME HUNTER V2\n\n"
 
         "🟢 ربات فعال شد\n\n"
 
@@ -978,9 +1072,8 @@ def start(message):
         "📊 /paper\n"
         "📡 /status\n\n"
 
-        "⭐ Min Score = 70\n"
         "🧪 Paper Trading = ON\n"
-        "💰 Real Trading = OFF 🔒"
+        "💰 Real Trading = LOCKED 🔒"
     )
 
 
@@ -993,9 +1086,7 @@ def start(message):
 )
 def settings(message):
 
-    state["chat_id"] = (
-        message.chat.id
-    )
+    state["chat_id"] = message.chat.id
 
     save_state()
 
@@ -1020,10 +1111,7 @@ def settings(message):
 def callbacks(call):
 
     s = state["settings"]
-
     data = call.data
-
-    # SCORE
 
     if data == "score_minus":
 
@@ -1039,8 +1127,6 @@ def callbacks(call):
             s["min_score"] + 5
         )
 
-    # BUY PRESSURE
-
     elif data == "buy_minus":
 
         s["min_buy_pressure"] = max(
@@ -1054,8 +1140,6 @@ def callbacks(call):
             95,
             s["min_buy_pressure"] + 5
         )
-
-    # SIZE
 
     elif data == "size_minus":
 
@@ -1077,8 +1161,6 @@ def callbacks(call):
             )
         )
 
-    # TP
-
     elif data == "tp_minus":
 
         s["take_profit"] = max(
@@ -1092,8 +1174,6 @@ def callbacks(call):
             100,
             s["take_profit"] + 5
         )
-
-    # SL
 
     elif data == "sl_minus":
 
@@ -1109,62 +1189,91 @@ def callbacks(call):
             s["stop_loss"] + 5
         )
 
-    # AUTO
-
     elif data == "auto_toggle":
 
-        s["auto_hunter"] = (
-            not s["auto_hunter"]
-        )
-
-    # PAPER
+        s["auto_hunter"] = not s["auto_hunter"]
 
     elif data == "paper_toggle":
 
-        s["paper_trading"] = (
-            not s["paper_trading"]
+        s["paper_trading"] = not s["paper_trading"]
+
+    elif data == "jupiter_test":
+
+        bot.answer_callback_query(
+            call.id,
+            "🪐 در حال تست Jupiter..."
         )
 
-    # REAL TRADING
+        candidates = scan_market()
 
-    elif data == "real_toggle":
+        if not candidates:
 
-        if not state["wallet_connected"]:
-
-            bot.answer_callback_query(
-
-                call.id,
-
-                "🔐 اول باید کیف پول را به روش امن متصل کنی.",
-                show_alert=True
+            bot.send_message(
+                call.message.chat.id,
+                "🪐 فعلاً کاندید مناسبی برای تست Jupiter پیدا نشد."
             )
 
             return
 
-        s["real_trading"] = (
-            not s["real_trading"]
+        score, info, opened = candidates[0]
+
+        result = test_jupiter_quote(info)
+
+        if not result["ok"]:
+
+            bot.send_message(
+
+                call.message.chat.id,
+
+                "❌ Jupiter Test Failed\n\n"
+                f"{result['error']}"
+            )
+
+            return
+
+        data_j = result["data"]
+
+        bot.send_message(
+
+            call.message.chat.id,
+
+            "🪐 JUPITER TEST\n\n"
+
+            f"🪙 {info['name']}\n"
+
+            f"⭐ Score: {score}/100\n"
+
+            f"💵 Input USD: "
+            f"${data_j.get('inUsdValue', 0):.4f}\n"
+
+            f"💰 Output USD: "
+            f"${data_j.get('outUsdValue', 0):.4f}\n"
+
+            f"📉 Price Impact: "
+            f"{data_j.get('priceImpact', 0)}\n"
+
+            f"🧭 Router: "
+            f"{data_j.get('router', 'unknown')}\n\n"
+
+            "✅ فقط Quote گرفته شد.\n"
+            "❌ هیچ معامله‌ای اجرا نشد."
         )
 
-        if s["real_trading"]:
+        return
 
-            bot.answer_callback_query(
+    elif data == "real_toggle":
 
-                call.id,
+        bot.answer_callback_query(
 
-                "⚠️ Real Trading فعال شد. قبل از ارسال هر تراکنش باید خود SafePal آن را تأیید کند.",
-                show_alert=True
-            )
+            call.id,
 
-        else:
+            "🔒 Real Trading فعلاً قفل است. "
+            "ابتدا باید سیستم امضای امن تراکنش اضافه شود.",
 
-            bot.answer_callback_query(
+            show_alert=True
+        )
 
-                call.id,
-
-                "🔴 Real Trading خاموش شد."
-            )
-
-    # WALLET
+        return
 
     elif data == "wallet_status":
 
@@ -1231,9 +1340,7 @@ def callbacks(call):
 )
 def status(message):
 
-    state["chat_id"] = (
-        message.chat.id
-    )
+    state["chat_id"] = message.chat.id
 
     save_state()
 
@@ -1253,8 +1360,7 @@ def status(message):
         f"🧪 Paper Trading: "
         f"{'فعال' if s['paper_trading'] else 'خاموش'}\n"
 
-        f"💰 Real Trading: "
-        f"{'فعال' if s['real_trading'] else 'خاموش 🔒'}\n\n"
+        "💰 Real Trading: 🔒 LOCKED\n\n"
 
         f"🔐 Wallet: "
         f"{'متصل 🟢' if state['wallet_connected'] else 'متصل نیست 🔴'}\n"
@@ -1279,9 +1385,7 @@ def status(message):
 )
 def hunt(message):
 
-    state["chat_id"] = (
-        message.chat.id
-    )
+    state["chat_id"] = message.chat.id
 
     save_state()
 
@@ -1307,9 +1411,7 @@ def hunt(message):
 
             return
 
-        text = (
-            "🦈 TOP HUNTS\n\n"
-        )
+        text = "🦈 TOP HUNTS\n\n"
 
         for i, (
             score,
@@ -1350,12 +1452,7 @@ def hunt(message):
                     "🧪 PAPER BUY: OPEN\n"
                 )
 
-            elif (
-                score
-                >=
-                state["settings"]
-                ["min_score"]
-            ):
+            elif score >= state["settings"]["min_score"]:
 
                 text += (
                     "🎯 QUALIFIED\n"
@@ -1380,13 +1477,13 @@ def hunt(message):
             f"🟢 Min Buy Pressure: "
             f"{state['settings']['min_buy_pressure']}%\n\n"
 
-            "💰 Real Trading: OFF 🔒"
+            "🪐 Jupiter: READY FOR QUOTE\n"
+
+            "💰 Real Trading: 🔒 LOCKED"
         )
 
         bot.send_message(
-
             message.chat.id,
-
             text
         )
 
@@ -1401,7 +1498,7 @@ def hunt(message):
 
 
 # =========================================================
-# PAPER STATS
+# PAPER
 # =========================================================
 
 @bot.message_handler(
@@ -1469,7 +1566,7 @@ def paper(message):
 
 
 # =========================================================
-# AUTO HUNTER
+# AUTO
 # =========================================================
 
 def auto_loop():
@@ -1488,9 +1585,7 @@ def auto_loop():
 
                 monitor_positions()
 
-                candidates = (
-                    scan_market()
-                )
+                candidates = scan_market()
 
                 for (
                     score,
@@ -1531,7 +1626,7 @@ def auto_loop():
 
 
 # =========================================================
-# START
+# RUN
 # =========================================================
 
 threading.Thread(
@@ -1540,7 +1635,7 @@ threading.Thread(
 ).start()
 
 print(
-    "🦈 MEME HUNTER FINAL RUNNING..."
+    "🦈 MEME HUNTER V2 RUNNING..."
 )
 
 bot.infinity_polling()
