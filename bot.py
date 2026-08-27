@@ -6,48 +6,23 @@ import requests
 import telebot
 from telebot import types
 
-# =========================================================
-# CONFIG
-# =========================================================
-
 TOKEN = os.getenv("BOT_TOKEN")
 JUPITER_API_KEY = os.getenv("JUPITER_API_KEY")
 
 if not TOKEN:
-    raise ValueError("❌ BOT_TOKEN پیدا نشد")
-
-if not JUPITER_API_KEY:
-    print("⚠️ JUPITER_API_KEY پیدا نشد")
+    raise ValueError("BOT_TOKEN پیدا نشد")
 
 bot = telebot.TeleBot(TOKEN)
 
-NEW_POOLS_API = (
-    "https://api.geckoterminal.com/api/v2/"
-    "networks/solana/new_pools"
-)
-
-POOL_API = (
-    "https://api.geckoterminal.com/api/v2/"
-    "networks/solana/pools/"
-)
-
-JUPITER_ORDER_API = (
-    "https://api.jup.ag/swap/v2/order"
-)
+NEW_POOLS_API = "https://api.geckoterminal.com/api/v2/networks/solana/new_pools"
+POOL_API = "https://api.geckoterminal.com/api/v2/networks/solana/pools/"
+JUPITER_API = "https://api.jup.ag/swap/v2/order"
 
 STATE_FILE = "bot_state.json"
-
-START_BALANCE = 5.00
+START_BALANCE = 5.0
 SCAN_INTERVAL = 180
 
-# Native SOL mint
-SOL_MINT = (
-    "So11111111111111111111111111111111111111112"
-)
-
-# =========================================================
-# SETTINGS
-# =========================================================
+SOL_MINT = "So11111111111111111111111111111111111111112"
 
 DEFAULT_SETTINGS = {
     "min_score": 70,
@@ -61,54 +36,37 @@ DEFAULT_SETTINGS = {
     "real_trading": False
 }
 
-# =========================================================
-# STATE
-# =========================================================
 
 def default_state():
-
     return {
         "balance": START_BALANCE,
         "trades": [],
         "open_positions": {},
         "chat_id": None,
-        "wallet_address": None,
-        "wallet_connected": False,
         "settings": DEFAULT_SETTINGS.copy()
     }
 
 
 def load_state():
-
     if not os.path.exists(STATE_FILE):
         return default_state()
 
     try:
-
-        with open(
-            STATE_FILE,
-            "r",
-            encoding="utf-8"
-        ) as f:
-
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
 
         result = default_state()
         result.update(data)
 
-        for key, value in DEFAULT_SETTINGS.items():
-
-            result["settings"].setdefault(
-                key,
-                value
-            )
+        result["settings"] = {
+            **DEFAULT_SETTINGS,
+            **result.get("settings", {})
+        }
 
         return result
 
     except Exception as e:
-
-        print("State load error:", e)
-
+        print("State error:", e)
         return default_state()
 
 
@@ -116,37 +74,24 @@ state = load_state()
 
 
 def save_state():
-
     try:
-
-        with open(
-            STATE_FILE,
-            "w",
-            encoding="utf-8"
-        ) as f:
-
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(
                 state,
                 f,
                 ensure_ascii=False,
                 indent=2
             )
-
     except Exception as e:
+        print("Save error:", e)
 
-        print("State save error:", e)
 
-
-# =========================================================
-# HTTP
-# =========================================================
-
-def get_json(url, params=None, headers=None):
+def get_json(url, headers=None, params=None):
 
     response = requests.get(
         url,
-        params=params,
         headers=headers,
+        params=params,
         timeout=20
     )
 
@@ -156,14 +101,13 @@ def get_json(url, params=None, headers=None):
 
 
 # =========================================================
-# GECKO
+# GECKO TERMINAL
 # =========================================================
 
 def get_new_pools():
 
     headers = {
-        "Accept":
-        "application/json;version=20230203"
+        "Accept": "application/json;version=20230203"
     }
 
     data = get_json(
@@ -171,10 +115,7 @@ def get_new_pools():
         headers=headers
     )
 
-    return data.get(
-        "data",
-        []
-    )
+    return data.get("data", [])
 
 
 def get_pool(address):
@@ -182,8 +123,7 @@ def get_pool(address):
     try:
 
         headers = {
-            "Accept":
-            "application/json;version=20230203"
+            "Accept": "application/json;version=20230203"
         }
 
         data = get_json(
@@ -191,139 +131,26 @@ def get_pool(address):
             headers=headers
         )
 
-        return data.get(
-            "data"
-        )
+        return data.get("data")
 
     except Exception as e:
 
-        print(
-            "Pool lookup error:",
-            e
-        )
+        print("Pool error:", e)
 
         return None
 
 
 # =========================================================
-# JUPITER
-# =========================================================
-
-def jupiter_order(
-    output_mint,
-    amount_lamports
-):
-
-    if not JUPITER_API_KEY:
-
-        return {
-            "ok": False,
-            "error":
-            "JUPITER_API_KEY تنظیم نشده"
-        }
-
-    params = {
-
-        "inputMint":
-        SOL_MINT,
-
-        "outputMint":
-        output_mint,
-
-        "amount":
-        str(int(amount_lamports)),
-
-        "swapMode":
-        "ExactIn",
-
-        "slippageBps":
-        300
-    }
-
-    headers = {
-
-        "x-api-key":
-        JUPITER_API_KEY
-    }
-
-    try:
-
-        response = requests.get(
-
-            JUPITER_ORDER_API,
-
-            params=params,
-
-            headers=headers,
-
-            timeout=20
-        )
-
-        response.raise_for_status()
-
-        data = response.json()
-
-        if data.get("error"):
-
-            return {
-                "ok": False,
-                "error":
-                data.get("errorMessage")
-                or data.get("error")
-            }
-
-        return {
-            "ok": True,
-            "data": data
-        }
-
-    except Exception as e:
-
-        return {
-            "ok": False,
-            "error": str(e)
-        }
-
-
-def test_jupiter_quote(info):
-
-    """
-    فقط quote می‌گیرد.
-    هیچ تراکنشی امضا یا اجرا نمی‌شود.
-    """
-
-    if not info["address"]:
-        return None
-
-    amount_lamports = int(
-        state["settings"]["trade_size"]
-        * 1_000_000_000
-    )
-
-    result = jupiter_order(
-        info["address"],
-        amount_lamports
-    )
-
-    return result
-
-
-# =========================================================
-# HELPERS
+# PARSER
 # =========================================================
 
 def number(value):
 
     try:
         return float(value or 0)
-
     except:
         return 0.0
 
-
-# =========================================================
-# PARSE POOL
-# =========================================================
 
 def parse_pool(pool):
 
@@ -359,19 +186,13 @@ def parse_pool(pool):
 
     total = buys + sells
 
-    buy_pressure = (
+    pressure = (
         buys / total
         if total
         else 0
     )
 
     return {
-
-        "id":
-        pool.get(
-            "id",
-            ""
-        ),
 
         "address":
         attrs.get(
@@ -413,13 +234,6 @@ def parse_pool(pool):
             )
         ),
 
-        "h24_volume":
-        number(
-            volume.get(
-                "h24"
-            )
-        ),
-
         "buys":
         buys,
 
@@ -427,12 +241,12 @@ def parse_pool(pool):
         sells,
 
         "buy_pressure":
-        buy_pressure
+        pressure
     }
 
 
 # =========================================================
-# SCORING
+# SCORE
 # =========================================================
 
 def calculate_score(info):
@@ -496,10 +310,7 @@ def calculate_score(info):
     elif pressure >= 0.55:
         score += 10
 
-    if fdv >= 100000:
-        score += 5
-
-    elif fdv >= 10000:
+    if fdv >= 10000:
         score += 8
 
     elif fdv >= 5000:
@@ -555,7 +366,9 @@ def paper_buy(info, score):
     if size <= 0:
         return False
 
-    position = {
+    state["balance"] -= size
+
+    state["open_positions"][address] = {
 
         "name":
         info["name"],
@@ -575,12 +388,6 @@ def paper_buy(info, score):
         "opened":
         time.time()
     }
-
-    state["balance"] -= size
-
-    state[
-        "open_positions"
-    ][address] = position
 
     save_state()
 
@@ -605,19 +412,17 @@ def close_position(
         [address]
     )
 
-    settings = state["settings"]
-
     if reason == "TP":
 
         change = (
-            settings["take_profit"]
+            state["settings"]["take_profit"]
             / 100
         )
 
     else:
 
         change = -(
-            settings["stop_loss"]
+            state["settings"]["stop_loss"]
             / 100
         )
 
@@ -650,13 +455,7 @@ def close_position(
         reason,
 
         "score":
-        position["score"],
-
-        "opened":
-        position["opened"],
-
-        "closed":
-        time.time()
+        position["score"]
     })
 
     del state[
@@ -704,26 +503,28 @@ def monitor_positions():
             if not position:
                 continue
 
-            settings = state["settings"]
+            entry = position["entry"]
 
             tp = (
-                position["entry"]
+                entry
                 *
                 (
                     1
                     +
-                    settings["take_profit"]
+                    state["settings"]
+                    ["take_profit"]
                     / 100
                 )
             )
 
             sl = (
-                position["entry"]
+                entry
                 *
                 (
                     1
                     -
-                    settings["stop_loss"]
+                    state["settings"]
+                    ["stop_loss"]
                     / 100
                 )
             )
@@ -739,12 +540,7 @@ def monitor_positions():
                 notify(
                     "🎯 TAKE PROFIT\n\n"
                     f"🪙 {position['name']}\n"
-                    f"💵 Entry: "
-                    f"${position['entry']:.10f}\n"
-                    f"💵 Exit: "
-                    f"${price:.10f}\n"
-                    f"💰 PnL: "
-                    f"${pnl:+.4f}"
+                    f"💰 PnL: ${pnl:+.4f}"
                 )
 
             elif price <= sl:
@@ -758,12 +554,7 @@ def monitor_positions():
                 notify(
                     "🛑 STOP LOSS\n\n"
                     f"🪙 {position['name']}\n"
-                    f"💵 Entry: "
-                    f"${position['entry']:.10f}\n"
-                    f"💵 Exit: "
-                    f"${price:.10f}\n"
-                    f"💰 PnL: "
-                    f"${pnl:+.4f}"
+                    f"💰 PnL: ${pnl:+.4f}"
                 )
 
         except Exception as e:
@@ -775,7 +566,7 @@ def monitor_positions():
 
 
 # =========================================================
-# SCANNER
+# MARKET SCANNER
 # =========================================================
 
 def scan_market():
@@ -797,15 +588,13 @@ def scan_market():
                 .upper()
             )
 
-            blocked = [
-                "USDC",
-                "USDT",
-                "WSOL"
-            ]
-
             if any(
-                word in name
-                for word in blocked
+                x in name
+                for x in [
+                    "USDC",
+                    "USDT",
+                    "WSOL"
+                ]
             ):
                 continue
 
@@ -850,7 +639,80 @@ def scan_market():
 
 
 # =========================================================
-# NOTIFY
+# JUPITER TEST
+# =========================================================
+
+def jupiter_test(token_address):
+
+    if not JUPITER_API_KEY:
+
+        return {
+            "ok": False,
+            "error":
+            "JUPITER_API_KEY تنظیم نشده"
+        }
+
+    amount = int(
+        state["settings"]["trade_size"]
+        * 1_000_000_000
+    )
+
+    params = {
+
+        "inputMint":
+        SOL_MINT,
+
+        "outputMint":
+        token_address,
+
+        "amount":
+        str(amount),
+
+        "swapMode":
+        "ExactIn",
+
+        "slippageBps":
+        300
+    }
+
+    headers = {
+
+        "x-api-key":
+        JUPITER_API_KEY
+    }
+
+    try:
+
+        response = requests.get(
+
+            JUPITER_API,
+
+            params=params,
+
+            headers=headers,
+
+            timeout=20
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        return {
+            "ok": True,
+            "data": data
+        }
+
+    except Exception as e:
+
+        return {
+            "ok": False,
+            "error": str(e)
+        }
+
+
+# =========================================================
+# TELEGRAM
 # =========================================================
 
 def notify(text):
@@ -872,7 +734,7 @@ def notify(text):
     except Exception as e:
 
         print(
-            "Telegram notify error:",
+            "Telegram error:",
             e
         )
 
@@ -884,13 +746,6 @@ def notify(text):
 def settings_text():
 
     s = state["settings"]
-
-    wallet = (
-        state["wallet_address"]
-        if state["wallet_connected"]
-        else
-        "❌ متصل نیست"
-    )
 
     return (
 
@@ -920,23 +775,15 @@ def settings_text():
         f"🧪 Paper Trading: "
         f"{'🟢 ON' if s['paper_trading'] else '🔴 OFF'}\n"
 
-        f"💰 Real Trading: "
-        f"{'🟢 ON' if s['real_trading'] else '🔒 LOCKED'}\n\n"
-
-        "🔐 WALLET\n"
-        f"{wallet}\n\n"
-
-        "🛡️ Real Trading هنوز قفل است."
+        "💰 Real Trading: 🔒 LOCKED"
     )
 
 
-# =========================================================
-# KEYBOARD
-# =========================================================
-
 def settings_keyboard():
 
-    keyboard = types.InlineKeyboardMarkup()
+    keyboard = (
+        types.InlineKeyboardMarkup()
+    )
 
     keyboard.row(
 
@@ -1004,42 +851,30 @@ def settings_keyboard():
     )
 
     keyboard.row(
-
         types.InlineKeyboardButton(
             "🦈 Auto ON/OFF",
-            callback_data="auto_toggle"
+            callback_data="auto"
         )
     )
 
     keyboard.row(
-
         types.InlineKeyboardButton(
             "🧪 Paper ON/OFF",
-            callback_data="paper_toggle"
+            callback_data="paper"
         )
     )
 
     keyboard.row(
-
         types.InlineKeyboardButton(
             "🪐 Jupiter Test",
-            callback_data="jupiter_test"
+            callback_data="jupiter"
         )
     )
 
     keyboard.row(
-
         types.InlineKeyboardButton(
             "💰 Real Trading",
-            callback_data="real_toggle"
-        )
-    )
-
-    keyboard.row(
-
-        types.InlineKeyboardButton(
-            "🔐 Wallet Status",
-            callback_data="wallet_status"
+            callback_data="real"
         )
     )
 
@@ -1055,7 +890,9 @@ def settings_keyboard():
 )
 def start(message):
 
-    state["chat_id"] = message.chat.id
+    state["chat_id"] = (
+        message.chat.id
+    )
 
     save_state()
 
@@ -1078,7 +915,7 @@ def start(message):
 
 
 # =========================================================
-# SETTINGS
+# SETTINGS COMMAND
 # =========================================================
 
 @bot.message_handler(
@@ -1086,7 +923,9 @@ def start(message):
 )
 def settings(message):
 
-    state["chat_id"] = message.chat.id
+    state["chat_id"] = (
+        message.chat.id
+    )
 
     save_state()
 
@@ -1111,6 +950,7 @@ def settings(message):
 def callbacks(call):
 
     s = state["settings"]
+
     data = call.data
 
     if data == "score_minus":
@@ -1189,127 +1029,114 @@ def callbacks(call):
             s["stop_loss"] + 5
         )
 
-    elif data == "auto_toggle":
+    elif data == "auto":
 
-        s["auto_hunter"] = not s["auto_hunter"]
+        s["auto_hunter"] = (
+            not s["auto_hunter"]
+        )
 
-    elif data == "paper_toggle":
+    elif data == "paper":
 
-        s["paper_trading"] = not s["paper_trading"]
+        s["paper_trading"] = (
+            not s["paper_trading"]
+        )
 
-    elif data == "jupiter_test":
+    elif data == "real":
+
+        bot.answer_callback_query(
+
+            call.id,
+
+            "🔒 Real Trading هنوز قفل است. "
+            "سیستم امضای امن کیف پول باید جداگانه اضافه شود.",
+
+            show_alert=True
+        )
+
+        return
+
+    elif data == "jupiter":
 
         bot.answer_callback_query(
             call.id,
             "🪐 در حال تست Jupiter..."
         )
 
-        candidates = scan_market()
+        try:
 
-        if not candidates:
+            candidates = scan_market()
 
-            bot.send_message(
-                call.message.chat.id,
-                "🪐 فعلاً کاندید مناسبی برای تست Jupiter پیدا نشد."
+            if not candidates:
+
+                bot.send_message(
+                    call.message.chat.id,
+                    "❌ کاندید مناسبی پیدا نشد."
+                )
+
+                return
+
+            score, info, opened = (
+                candidates[0]
             )
 
-            return
+            result = jupiter_test(
+                info["address"]
+            )
 
-        score, info, opened = candidates[0]
+            if not result["ok"]:
 
-        result = test_jupiter_quote(info)
+                bot.send_message(
 
-        if not result["ok"]:
+                    call.message.chat.id,
+
+                    "❌ Jupiter Test Failed\n\n"
+                    f"{result['error']}"
+                )
+
+                return
+
+            data_j = result["data"]
 
             bot.send_message(
 
                 call.message.chat.id,
 
-                "❌ Jupiter Test Failed\n\n"
-                f"{result['error']}"
+                "🪐 JUPITER TEST\n\n"
+
+                f"🪙 {info['name']}\n"
+
+                f"⭐ Score: "
+                f"{score}/100\n"
+
+                f"💰 Output USD: "
+                f"{data_j.get('outUsdValue', '?')}\n"
+
+                f"📉 Price Impact: "
+                f"{data_j.get('priceImpact', '?')}\n\n"
+
+                "✅ Quote دریافت شد.\n"
+                "❌ هیچ معامله‌ای انجام نشد."
             )
 
-            return
+        except Exception as e:
 
-        data_j = result["data"]
+            bot.send_message(
 
-        bot.send_message(
+                call.message.chat.id,
 
-            call.message.chat.id,
-
-            "🪐 JUPITER TEST\n\n"
-
-            f"🪙 {info['name']}\n"
-
-            f"⭐ Score: {score}/100\n"
-
-            f"💵 Input USD: "
-            f"${data_j.get('inUsdValue', 0):.4f}\n"
-
-            f"💰 Output USD: "
-            f"${data_j.get('outUsdValue', 0):.4f}\n"
-
-            f"📉 Price Impact: "
-            f"{data_j.get('priceImpact', 0)}\n"
-
-            f"🧭 Router: "
-            f"{data_j.get('router', 'unknown')}\n\n"
-
-            "✅ فقط Quote گرفته شد.\n"
-            "❌ هیچ معامله‌ای اجرا نشد."
-        )
-
-        return
-
-    elif data == "real_toggle":
-
-        bot.answer_callback_query(
-
-            call.id,
-
-            "🔒 Real Trading فعلاً قفل است. "
-            "ابتدا باید سیستم امضای امن تراکنش اضافه شود.",
-
-            show_alert=True
-        )
-
-        return
-
-    elif data == "wallet_status":
-
-        wallet = (
-            state["wallet_address"]
-            or
-            "❌ متصل نیست"
-        )
-
-        bot.answer_callback_query(
-
-            call.id,
-
-            f"🔐 Wallet:\n{wallet}",
-
-            show_alert=True
-        )
-
-        return
-
-    else:
-
-        bot.answer_callback_query(
-            call.id
-        )
+                f"❌ Jupiter Error\n\n{e}"
+            )
 
         return
 
     save_state()
 
-    try:
+    bot.answer_callback_query(
+        call.id,
+        "✅ ذخیره شد"
+    )
 
-        bot.answer_callback_query(
-            call.id,
-            "✅ ذخیره شد"
-        )
+    try:
 
         bot.edit_message_text(
 
@@ -1326,7 +1153,7 @@ def callbacks(call):
     except Exception as e:
 
         print(
-            "Keyboard error:",
+            "Edit error:",
             e
         )
 
@@ -1340,7 +1167,9 @@ def callbacks(call):
 )
 def status(message):
 
-    state["chat_id"] = message.chat.id
+    state["chat_id"] = (
+        message.chat.id
+    )
 
     save_state()
 
@@ -1355,15 +1184,10 @@ def status(message):
         f"🦈 Auto Hunter: "
         f"{'فعال' if s['auto_hunter'] else 'خاموش'}\n"
 
-        "📡 Position Monitor: فعال\n"
-
         f"🧪 Paper Trading: "
         f"{'فعال' if s['paper_trading'] else 'خاموش'}\n"
 
         "💰 Real Trading: 🔒 LOCKED\n\n"
-
-        f"🔐 Wallet: "
-        f"{'متصل 🟢' if state['wallet_connected'] else 'متصل نیست 🔴'}\n"
 
         f"💵 Balance: "
         f"${state['balance']:.2f}\n"
@@ -1385,15 +1209,15 @@ def status(message):
 )
 def hunt(message):
 
-    state["chat_id"] = message.chat.id
+    state["chat_id"] = (
+        message.chat.id
+    )
 
     save_state()
 
     bot.send_message(
-
         message.chat.id,
-
-        "🔎 در حال اسکن New Pools سولانا..."
+        "🔎 در حال اسکن سولانا..."
     )
 
     try:
@@ -1403,9 +1227,7 @@ def hunt(message):
         if not candidates:
 
             bot.send_message(
-
                 message.chat.id,
-
                 "🔎 فعلاً فرصت مناسبی پیدا نشد."
             )
 
@@ -1443,32 +1265,14 @@ def hunt(message):
                 f"{info['sells']}\n"
 
                 f"🟢 Buy pressure: "
-                f"{info['buy_pressure'] * 100:.0f}%\n"
+                f"{info['buy_pressure']*100:.0f}%\n"
+
+                f"{'🧪 PAPER BUY: OPEN' if opened else ('🎯 QUALIFIED' if score >= state['settings']['min_score'] else '👀 WATCHING')}\n\n"
             )
-
-            if opened:
-
-                text += (
-                    "🧪 PAPER BUY: OPEN\n"
-                )
-
-            elif score >= state["settings"]["min_score"]:
-
-                text += (
-                    "🎯 QUALIFIED\n"
-                )
-
-            else:
-
-                text += (
-                    "👀 WATCHING\n"
-                )
-
-            text += "\n"
 
         text += (
 
-            "🧪 Paper Trading: "
+            f"🧪 Paper Trading: "
             f"{'ON' if state['settings']['paper_trading'] else 'OFF'}\n"
 
             f"🎯 Min Score: "
@@ -1476,8 +1280,6 @@ def hunt(message):
 
             f"🟢 Min Buy Pressure: "
             f"{state['settings']['min_buy_pressure']}%\n\n"
-
-            "🪐 Jupiter: READY FOR QUOTE\n"
 
             "💰 Real Trading: 🔒 LOCKED"
         )
@@ -1490,15 +1292,13 @@ def hunt(message):
     except Exception as e:
 
         bot.send_message(
-
             message.chat.id,
-
-            f"❌ خطا در اسکن:\n{e}"
+            f"❌ خطا:\n{e}"
         )
 
 
 # =========================================================
-# PAPER
+# PAPER STATS
 # =========================================================
 
 @bot.message_handler(
@@ -1510,29 +1310,26 @@ def paper(message):
 
     wins = sum(
         1
-        for trade in trades
-        if trade["pnl"] > 0
+        for t in trades
+        if t["pnl"] > 0
     )
 
     losses = sum(
         1
-        for trade in trades
-        if trade["pnl"] < 0
+        for t in trades
+        if t["pnl"] < 0
     )
 
     total = len(trades)
 
     pnl = sum(
-        trade["pnl"]
-        for trade in trades
+        t["pnl"]
+        for t in trades
     )
 
     win_rate = (
-
         wins / total * 100
-
         if total
-
         else 0
     )
 
@@ -1566,7 +1363,7 @@ def paper(message):
 
 
 # =========================================================
-# AUTO
+# AUTO HUNTER
 # =========================================================
 
 def auto_loop():
@@ -1585,7 +1382,9 @@ def auto_loop():
 
                 monitor_positions()
 
-                candidates = scan_market()
+                candidates = (
+                    scan_market()
+                )
 
                 for (
                     score,
@@ -1608,15 +1407,13 @@ def auto_loop():
                             f"${info['price']:.10f}\n"
 
                             f"🟢 Buy pressure: "
-                            f"{info['buy_pressure'] * 100:.0f}%\n\n"
-
-                            "🧪 Paper Trading"
+                            f"{info['buy_pressure']*100:.0f}%"
                         )
 
         except Exception as e:
 
             print(
-                "Auto Hunter error:",
+                "Auto error:",
                 e
             )
 
