@@ -1,7 +1,14 @@
-- name: Run bot
-  env:
-  BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-  PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
-  LIVE_TRADING: "true"
-  RPC_URL: ${{ secrets.RPC_URL }}
-  run: python bot.py
+      - name: Check LIVE_TRADING
+        env:
+          LIVE_TRADING: "true"
+        run: |
+          echo "LIVE_TRADING=$LIVE_TRADING"
+
+      - name: Run bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
+          LIVE_TRADING: "true"
+        run: |
+          echo "Starting bot..."
+          python bot.py
