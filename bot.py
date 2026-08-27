@@ -1,10 +1,12 @@
 import os
 import time
 import json
+import base64
 import threading
 from datetime import datetime, timezone
 
 import requests
+import base58
 import telebot
 from telebot import types
 
@@ -14,129 +16,80 @@ from solders.transaction import VersionedTransaction
 
 # ============================================================
 # 🦈 SOLANA HUNTER V6
-# JUPITER + TELEGRAM + RISK MANAGEMENT
+# REAL TRADING
+# Jupiter V6 + Telegram Dashboard + Risk Management
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-JUPITER_API_KEY = os.getenv("JUPITER_API_KEY")
-PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
-
-# IMPORTANT:
-# Keep this FALSE for the first test.
-# Change GitHub Secret LIVE_TRADING to true only after
-# Telegram + wallet + Jupiter connection are confirmed.
-LIVE_TRADING = os.getenv("LIVE_TRADING", "false").lower() == "true"
-
+PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 RPC_URL = os.getenv(
-    "SOLANA_RPC_URL",
+    "RPC_URL",
     "https://api.mainnet-beta.solana.com"
 )
+
+# MUST be explicitly enabled in GitHub Secrets
+LIVE_TRADING = os.getenv(
+    "LIVE_TRADING",
+    "false"
+).lower() == "true"
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
 
-if not JUPITER_API_KEY:
-    raise RuntimeError("JUPITER_API_KEY is missing")
-
 if not PRIVATE_KEY:
-    raise RuntimeError("SOLANA_PRIVATE_KEY is missing")
+    raise RuntimeError("PRIVATE_KEY is missing")
+
+if not LIVE_TRADING:
+    raise RuntimeError(
+        "LIVE_TRADING must be set to true before real trading starts."
+    )
 
 
 # ============================================================
-# SETTINGS
+# CONSTANTS
 # ============================================================
 
-START_BALANCE = 3.5015
-
-MAX_TRADE_SOL = float(
-    os.getenv("MAX_TRADE_SOL", "0.02")
-)
-
-MAX_OPEN_TRADES = int(
-    os.getenv("MAX_OPEN_TRADES", "2")
-)
-
-TAKE_PROFIT = float(
-    os.getenv("TAKE_PROFIT_PCT", "15")
-) / 100
-
-STOP_LOSS = float(
-    os.getenv("STOP_LOSS_PCT", "8")
-) / 100
-
-TRAILING_START = float(
-    os.getenv("TRAILING_START_PCT", "10")
-) / 100
-
-TRAILING_DISTANCE = float(
-    os.getenv("TRAILING_DISTANCE_PCT", "5")
-) / 100
-
-MIN_SCORE = int(
-    os.getenv("MIN_SCORE", "75")
-)
-
-MIN_BUY_PRESSURE = float(
-    os.getenv("MIN_BUY_PRESSURE", "60")
-)
-
-MIN_LIQUIDITY = float(
-    os.getenv("MIN_LIQUIDITY", "30000")
-)
-
-MIN_M5_VOLUME = float(
-    os.getenv("MIN_M5_VOLUME", "15000")
-)
-
-SCAN_SECONDS = int(
-    os.getenv("SCAN_SECONDS", "20")
-)
-
-COOLDOWN_SECONDS = int(
-    os.getenv("COOLDOWN_SECONDS", "600")
-)
-
-MAX_CONSECUTIVE_LOSSES = int(
-    os.getenv("MAX_CONSECUTIVE_LOSSES", "3")
-)
-
-LOSS_PAUSE_SECONDS = int(
-    os.getenv("LOSS_PAUSE_SECONDS", "900")
-)
-
-# Jupiter uses basis points for slippage-related settings.
-SLIPPAGE_BPS = int(
-    os.getenv("SLIPPAGE_BPS", "100")
-)
-
-
-# ============================================================
-# API
-# ============================================================
+SOL_MINT = "So11111111111111111111111111111111111111112"
 
 DEX_API = "https://api.dexscreener.com"
 
-JUPITER_API = "https://api.jup.ag"
+JUP_QUOTE = "https://quote-api.jup.ag/v6/quote"
+JUP_SWAP = "https://quote-api.jup.ag/v6/swap"
 
-JUPITER_ORDER_URL = (
-    f"{JUPITER_API}/ultra/v1/order"
-)
+STATE_FILE = "paper_state_v6.json"
+CONFIG_FILE = "bot_config_v6.json"
 
-JUPITER_EXECUTE_URL = (
-    f"{JUPITER_API}/ultra/v1/execute"
-)
+# Starting value is only used for statistics.
+START_BALANCE_SOL = 0.0
+
+LAMPORTS_PER_SOL = 1_000_000_000
+
+# Safety reserve for network fees.
+MIN_SOL_RESERVE = 0.01
 
 
 # ============================================================
-# HTTP
+# WALLET
 # ============================================================
 
-session = requests.Session()
+try:
+    secret = base58.b58decode(PRIVATE_KEY)
 
-session.headers.update({
-    "User-Agent": "SolanaHunterV6/1.0",
-    "x-api-key": JUPITER_API_KEY
-})
+    if len(secret) == 64:
+        keypair = Keypair.from_bytes(secret)
+    elif len(secret) == 32:
+        keypair = Keypair.from_seed(secret)
+    else:
+        raise ValueError(
+            "PRIVATE_KEY must be a base58 32-byte seed or 64-byte keypair."
+        )
+
+except Exception as e:
+    raise RuntimeError(
+        f"PRIVATE_KEY is invalid: {e}"
+    )
+
+WALLET = str(keypair.pubkey())
 
 
 # ============================================================
@@ -148,57 +101,78 @@ bot = telebot.TeleBot(
     parse_mode="HTML"
 )
 
+session = requests.Session()
+
+session.headers.update({
+    "User-Agent": "SolanaHunterV6/1.0",
+    "Accept": "application/json"
+})
+
 
 # ============================================================
-# WALLET
+# CONFIG
 # ============================================================
 
-def load_keypair():
+DEFAULT_CONFIG = {
 
-    raw = PRIVATE_KEY.strip()
+    # Discovery
+    "min_score": 75,
+    "min_buy_pressure": 60.0,
+    "min_liquidity": 30000.0,
+    "min_m5_volume": 15000.0,
 
-    # JSON array:
-    # [12,34,56,...]
-    if raw.startswith("["):
+    "min_m5_change": -5.0,
+    "max_m5_change": 15.0,
 
-        data = json.loads(raw)
+    # Real trading
+    "risk_per_trade": 0.10,
+    "max_open_trades": 2,
 
-        return Keypair.from_bytes(
-            bytes(data)
-        )
+    # Exits
+    "take_profit": 0.15,
+    "stop_loss": 0.08,
 
-    # Base58 private key
-    try:
+    # Profit lock
+    "profit_lock_trigger": 0.10,
+    "profit_lock_percent": 0.50,
 
-        return Keypair.from_base58_string(
-            raw
-        )
+    # Trailing
+    "trailing_start": 0.12,
+    "trailing_distance": 0.05,
 
-    except Exception:
+    # Jupiter
+    "slippage_bps": 100,
 
-        raise RuntimeError(
-            "SOLANA_PRIVATE_KEY format is invalid"
-        )
+    # Scan
+    "scan_seconds": 20,
+
+    # Protection
+    "cooldown_seconds": 600,
+    "crash_m5": -8.0,
+
+    "max_consecutive_losses": 3,
+    "loss_pause_seconds": 900,
+
+    # Position limits
+    "min_trade_sol": 0.005,
+    "max_trade_sol": 0.50,
+
+    "enabled": True
+}
 
 
-wallet = load_keypair()
-
-WALLET_ADDRESS = str(
-    wallet.pubkey()
-)
+config = DEFAULT_CONFIG.copy()
 
 
 # ============================================================
 # STATE
 # ============================================================
 
-STATE_FILE = "state_v6.json"
-
 state = {
 
-    "balance": START_BALANCE,
+    "balance_sol": 0.0,
 
-    "starting_balance": START_BALANCE,
+    "starting_balance_sol": 0.0,
 
     "open_trades": [],
 
@@ -208,7 +182,9 @@ state = {
 
     "losses": 0,
 
-    "total_pnl": 0.0,
+    "total_pnl_sol": 0.0,
+
+    "locked_profit_sol": 0.0,
 
     "consecutive_losses": 0,
 
@@ -224,20 +200,18 @@ state = {
 
     "dashboard_message_id": None,
 
-    "enabled": True,
-
-    "wallet": WALLET_ADDRESS
+    "waiting_setting": None
 }
+
 
 lock = threading.Lock()
 
 
 # ============================================================
-# HELPERS
+# BASIC HELPERS
 # ============================================================
 
 def now_utc():
-
     return datetime.now(
         timezone.utc
     ).strftime(
@@ -246,17 +220,46 @@ def now_utc():
 
 
 def num(value, default=0.0):
-
     try:
         return float(value)
     except Exception:
         return default
 
 
-def money(value):
+def money_sol(value):
+    return f"{num(value):.6f} SOL"
 
-    return f"${num(value):.4f}"
 
+def rpc(method, params=None):
+
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params or []
+    }
+
+    response = session.post(
+        RPC_URL,
+        json=payload,
+        timeout=20
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    if "error" in data:
+        raise RuntimeError(
+            str(data["error"])
+        )
+
+    return data.get("result")
+
+
+# ============================================================
+# STATE FILE
+# ============================================================
 
 def save_state():
 
@@ -302,7 +305,9 @@ def load_state():
 
             saved = json.load(f)
 
-        state.update(saved)
+        state.update(
+            saved
+        )
 
     except Exception as e:
 
@@ -313,67 +318,115 @@ def load_state():
 
 
 # ============================================================
-# SOLANA RPC
+# CONFIG FILE
 # ============================================================
 
-def rpc(method, params=None):
+def save_config():
 
-    payload = {
+    try:
 
-        "jsonrpc": "2.0",
+        with open(
+            CONFIG_FILE,
+            "w",
+            encoding="utf-8"
+        ) as f:
 
-        "id": 1,
+            json.dump(
+                config,
+                f,
+                indent=2,
+                ensure_ascii=False
+            )
 
-        "method": method,
+    except Exception as e:
 
-        "params": params or []
-    }
-
-    response = requests.post(
-
-        RPC_URL,
-
-        json=payload,
-
-        timeout=20
-    )
-
-    response.raise_for_status()
-
-    data = response.json()
-
-    if "error" in data:
-
-        raise RuntimeError(
-            str(data["error"])
+        print(
+            "CONFIG SAVE ERROR:",
+            e
         )
 
-    return data.get(
-        "result"
-    )
 
+def load_config():
+
+    global config
+
+    if not os.path.exists(
+        CONFIG_FILE
+    ):
+        return
+
+    try:
+
+        with open(
+            CONFIG_FILE,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
+            saved = json.load(f)
+
+        for key in DEFAULT_CONFIG:
+
+            if key in saved:
+                config[key] = saved[key]
+
+    except Exception as e:
+
+        print(
+            "CONFIG LOAD ERROR:",
+            e
+        )
+
+
+# ============================================================
+# SOL BALANCE
+# ============================================================
 
 def get_sol_balance():
 
     result = rpc(
         "getBalance",
-        [
-            WALLET_ADDRESS,
-            {
-                "commitment": "confirmed"
-            }
-        ]
+        [WALLET]
     )
 
-    lamports = result[
-        "value"
-    ]
+    lamports = int(
+        result["value"]
+    )
 
-    return lamports / 1_000_000_000
+    return lamports / LAMPORTS_PER_SOL
+
+
+def update_balance():
+
+    try:
+
+        state["balance_sol"] = (
+            get_sol_balance()
+        )
+
+        if (
+            state["starting_balance_sol"]
+            <= 0
+        ):
+
+            state[
+                "starting_balance_sol"
+            ] = state[
+                "balance_sol"
+            ]
+
+        save_state()
+
+    except Exception as e:
+
+        print(
+            "BALANCE ERROR:",
+            e
+        )
 
 
 # ============================================================
-# TELEGRAM MENUS
+# TELEGRAM MENU
 # ============================================================
 
 def main_menu():
@@ -384,50 +437,166 @@ def main_menu():
     )
 
     markup.add(
-
         types.KeyboardButton(
             "🦈 داشبورد"
         ),
-
         types.KeyboardButton(
             "🎯 شکارها"
         )
     )
 
     markup.add(
-
         types.KeyboardButton(
             "📂 معاملات باز"
         ),
-
         types.KeyboardButton(
             "📜 تاریخچه"
         )
     )
 
     markup.add(
-
-        types.KeyboardButton(
-            "💰 کیف پول"
-        ),
-
         types.KeyboardButton(
             "⚙️ تنظیمات"
+        ),
+        types.KeyboardButton(
+            "⏸️ توقف / ▶️ ادامه"
         )
     )
 
     markup.add(
-
-        types.KeyboardButton(
-            "⏸️ توقف / ▶️ ادامه"
-        ),
-
         types.KeyboardButton(
             "ℹ️ وضعیت"
         )
     )
 
     return markup
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+def settings_menu():
+
+    markup = types.InlineKeyboardMarkup(
+        row_width=2
+    )
+
+    buttons = [
+
+        ("⭐ Score", "set_score"),
+        ("🟢 Buy Pressure", "set_pressure"),
+
+        ("💧 Liquidity", "set_liquidity"),
+        ("📊 M5 Volume", "set_volume"),
+
+        ("🎯 Take Profit", "set_tp"),
+        ("🛑 Stop Loss", "set_sl"),
+
+        ("🔒 Profit Lock", "set_profit_lock"),
+        ("📈 Trailing", "set_trailing"),
+
+        ("🛡️ Risk / Trade", "set_risk"),
+        ("📂 Max Trades", "set_max_trades"),
+
+        ("⛽ Slippage", "set_slippage"),
+        ("⏱️ Scan", "set_scan"),
+
+        ("🚫 Cooldown", "set_cooldown")
+    ]
+
+    for i in range(
+        0,
+        len(buttons),
+        2
+    ):
+
+        row = []
+
+        for label, callback in buttons[
+            i:i + 2
+        ]:
+
+            row.append(
+                types.InlineKeyboardButton(
+                    label,
+                    callback_data=callback
+                )
+            )
+
+        markup.row(
+            *row
+        )
+
+    markup.add(
+        types.InlineKeyboardButton(
+            "🔄 تنظیمات پیش‌فرض",
+            callback_data="reset_config"
+        )
+    )
+
+    return markup
+
+
+def settings_text():
+
+    return f"""
+<b>⚙️ SOLANA HUNTER V6</b>
+
+━━━━━━━━━━━━━━━━━━━━
+
+⭐ Min Score:
+<b>{config["min_score"]}</b>
+
+🟢 Buy Pressure:
+<b>{config["min_buy_pressure"]:.0f}%+</b>
+
+💧 Liquidity:
+<b>${config["min_liquidity"]:,.0f}+</b>
+
+📊 M5 Volume:
+<b>${config["min_m5_volume"]:,.0f}+</b>
+
+━━━━━━━━━━━━━━━━━━━━
+
+🎯 Take Profit:
+<b>+{config["take_profit"] * 100:.0f}%</b>
+
+🛑 Stop Loss:
+<b>-{config["stop_loss"] * 100:.0f}%</b>
+
+🔒 Profit Lock:
+<b>+{config["profit_lock_trigger"] * 100:.0f}%</b>
+
+📈 Trailing:
+<b>+{config["trailing_start"] * 100:.0f}% /
+-{config["trailing_distance"] * 100:.0f}%</b>
+
+━━━━━━━━━━━━━━━━━━━━
+
+🛡️ Risk:
+<b>{config["risk_per_trade"] * 100:.0f}%</b>
+
+📂 Max Trades:
+<b>{config["max_open_trades"]}</b>
+
+⛽ Slippage:
+<b>{config["slippage_bps"] / 100:.2f}%</b>
+
+⏱️ Scan:
+<b>{config["scan_seconds"]}s</b>
+
+🚫 Cooldown:
+<b>{config["cooldown_seconds"]}s</b>
+
+━━━━━━━━━━━━━━━━━━━━
+
+🔴 MODE:
+<b>REAL TRADING</b>
+
+💰 Wallet:
+<code>{WALLET}</code>
+"""
 
 
 # ============================================================
@@ -478,7 +647,6 @@ def latest_solana_tokens():
                 )
 
                 if address:
-
                     result[
                         address
                     ] = item
@@ -500,9 +668,7 @@ def get_pairs(address):
     try:
 
         response = session.get(
-
             f"{DEX_API}/latest/dex/tokens/{address}",
-
             timeout=10
         )
 
@@ -517,12 +683,8 @@ def get_pairs(address):
         )
 
         return [
-
             p for p in pairs
-
-            if p.get(
-                "chainId"
-            ) == "solana"
+            if p.get("chainId") == "solana"
         ]
 
     except Exception as e:
@@ -611,7 +773,6 @@ def analyze(pair):
         pressure = 0
 
         if total:
-
             pressure = (
                 buys / total
             ) * 100
@@ -629,52 +790,40 @@ def analyze(pair):
 
         if liquidity >= 100000:
             score += 20
-
         elif liquidity >= 50000:
             score += 17
-
         elif liquidity >= 30000:
             score += 14
 
         if volume >= 100000:
             score += 20
-
         elif volume >= 50000:
             score += 17
-
         elif volume >= 25000:
             score += 14
-
         elif volume >= 15000:
             score += 10
 
         if pressure >= 80:
             score += 25
-
         elif pressure >= 70:
             score += 21
-
         elif pressure >= 60:
             score += 16
 
         if total >= 500:
             score += 15
-
         elif total >= 200:
             score += 13
-
         elif total >= 100:
             score += 10
-
         elif total >= 50:
             score += 7
 
         if 1 <= m5 <= 8:
             score += 15
-
         elif 0 <= m5 < 1:
             score += 8
-
         elif 8 < m5 <= 15:
             score += 10
 
@@ -695,23 +844,14 @@ def analyze(pair):
         return {
 
             "address": address,
-
             "symbol": symbol,
-
             "price": price,
-
             "liquidity": liquidity,
-
             "volume": volume,
-
             "buys": buys,
-
             "sells": sells,
-
             "buy_pressure": pressure,
-
             "m5": m5,
-
             "score": score
         }
 
@@ -726,42 +866,56 @@ def analyze(pair):
 
 
 # ============================================================
-# FILTER
+# ENTRY FILTER
 # ============================================================
 
 def check_entry(t):
 
-    if t["score"] < MIN_SCORE:
+    if t["score"] < config["min_score"]:
         return False
 
-    if t["buy_pressure"] < MIN_BUY_PRESSURE:
+    if t["buy_pressure"] < config["min_buy_pressure"]:
         return False
 
-    if t["liquidity"] < MIN_LIQUIDITY:
+    if t["liquidity"] < config["min_liquidity"]:
         return False
 
-    if t["volume"] < MIN_M5_VOLUME:
+    if t["volume"] < config["min_m5_volume"]:
         return False
 
-    if t["m5"] < -5:
+    if t["m5"] < config["min_m5_change"]:
         return False
 
-    if t["m5"] > 15:
+    if t["m5"] > config["max_m5_change"]:
+        return False
+
+    if t["m5"] <= config["crash_m5"]:
+        return False
+
+    if t["price"] <= 0:
         return False
 
     return True
 
 
 # ============================================================
-# COOLDOWN
+# TRADE HELPERS
 # ============================================================
+
+def find_trade(address):
+
+    for trade in state["open_trades"]:
+
+        if trade["address"] == address:
+            return trade
+
+    return None
+
 
 def is_cooldown(address):
 
     until = num(
-        state[
-            "cooldowns"
-        ].get(
+        state["cooldowns"].get(
             address,
             0
         )
@@ -772,48 +926,20 @@ def is_cooldown(address):
 
 def set_cooldown(address):
 
-    state[
-        "cooldowns"
-    ][address] = (
-
+    state["cooldowns"][address] = (
         time.time()
-        + COOLDOWN_SECONDS
+        + config["cooldown_seconds"]
     )
 
 
 # ============================================================
-# OPEN TRADE
+# JUPITER QUOTE
 # ============================================================
 
-def find_trade(address):
-
-    for trade in state[
-        "open_trades"
-    ]:
-
-        if trade[
-            "address"
-        ] == address:
-
-            return trade
-
-    return None
-
-
-# ============================================================
-# JUPITER ORDER
-# ============================================================
-
-def jupiter_order(
-
+def jupiter_quote(
     input_mint,
-
     output_mint,
-
-    amount,
-
-    taker=WALLET_ADDRESS
-
+    amount
 ):
 
     params = {
@@ -822,17 +948,69 @@ def jupiter_order(
 
         "outputMint": output_mint,
 
-        "amount": str(amount),
+        "amount": str(
+            int(amount)
+        ),
 
-        "taker": taker
+        "slippageBps": int(
+            config["slippage_bps"]
+        ),
+
+        "swapMode": "ExactIn"
     }
 
     response = session.get(
-
-        JUPITER_ORDER_URL,
-
+        JUP_QUOTE,
         params=params,
+        timeout=20
+    )
 
+    response.raise_for_status()
+
+    data = response.json()
+
+    if not data.get(
+        "outAmount"
+    ):
+        raise RuntimeError(
+            "Jupiter returned no route."
+        )
+
+    return data
+
+
+# ============================================================
+# JUPITER SWAP
+# ============================================================
+
+def jupiter_swap(
+    input_mint,
+    output_mint,
+    amount
+):
+
+    quote = jupiter_quote(
+        input_mint,
+        output_mint,
+        amount
+    )
+
+    body = {
+
+        "quoteResponse": quote,
+
+        "userPublicKey": WALLET,
+
+        "wrapAndUnwrapSol": True,
+
+        "dynamicComputeUnitLimit": True,
+
+        "prioritizationFeeLamports": "auto"
+    }
+
+    response = session.post(
+        JUP_SWAP,
+        json=body,
         timeout=30
     )
 
@@ -840,197 +1018,197 @@ def jupiter_order(
 
     data = response.json()
 
-    if data.get(
-        "errorCode"
-    ):
+    transaction_b64 = data.get(
+        "swapTransaction"
+    )
 
+    if not transaction_b64:
         raise RuntimeError(
-            data.get(
-                "errorMessage",
-                "Jupiter order error"
-            )
+            f"Jupiter swap error: {data}"
         )
 
-    return data
-
-
-# ============================================================
-# JUPITER EXECUTE
-# ============================================================
-
-def jupiter_execute(
-
-    signed_transaction,
-
-    request_id
-
-):
-
-    payload = {
-
-        "signedTransaction":
-            signed_transaction,
-
-        "requestId":
-            request_id
-    }
-
-    response = session.post(
-
-        JUPITER_EXECUTE_URL,
-
-        json=payload,
-
-        timeout=60
+    tx_bytes = base64.b64decode(
+        transaction_b64
     )
 
-    response.raise_for_status()
-
-    return response.json()
-
-
-# ============================================================
-# REAL BUY
-# ============================================================
-
-def real_buy(
-
-    token_address,
-
-    symbol
-
-):
-
-    if not LIVE_TRADING:
-
-        return {
-
-            "success": False,
-
-            "test": True,
-
-            "message":
-                "LIVE_TRADING=false"
-        }
-
-    sol_balance = get_sol_balance()
-
-    amount_sol = min(
-
-        MAX_TRADE_SOL,
-
-        max(
-            0,
-            sol_balance - 0.005
+    transaction = (
+        VersionedTransaction.from_bytes(
+            tx_bytes
         )
     )
 
-    if amount_sol <= 0:
-
-        raise RuntimeError(
-            "Not enough SOL for trade + fees"
-        )
-
-    lamports = int(
-        amount_sol
-        * 1_000_000_000
+    transaction.sign(
+        [keypair]
     )
 
-    order = jupiter_order(
-
-        input_mint=
-            "So11111111111111111111111111111111111111112",
-
-        output_mint=
-            token_address,
-
-        amount=
-            lamports
-    )
-
-    transaction = order.get(
-        "transaction"
-    )
-
-    request_id = order.get(
-        "requestId"
-    )
-
-    if not transaction:
-        raise RuntimeError(
-            "Jupiter did not return transaction"
-        )
-
-    if not request_id:
-        raise RuntimeError(
-            "Jupiter did not return requestId"
-        )
-
-    raw_transaction = bytes.fromhex(
+    raw = bytes(
         transaction
     )
 
-    tx = VersionedTransaction.from_bytes(
-        raw_transaction
+    result = rpc(
+        "sendTransaction",
+        [
+            base64.b64encode(
+                raw
+            ).decode(),
+            {
+                "encoding": "base64",
+                "skipPreflight": False,
+                "maxRetries": 3
+            }
+        ]
     )
 
-    signed_tx = VersionedTransaction(
-        tx.message,
-        [wallet]
-    )
+    return str(
+        result
+    ), quote
 
-    signed_hex = bytes(
-        signed_tx
-    ).hex()
 
-    result = jupiter_execute(
+# ============================================================
+# BUY REAL
+# ============================================================
 
-        signed_hex,
+def real_buy(t):
 
-        request_id
-    )
+    if not config["enabled"]:
+        return False
 
-    status = str(
-        result.get(
-            "status",
-            ""
+    if time.time() < num(
+        state["paused_until"]
+    ):
+        return False
+
+    if len(
+        state["open_trades"]
+    ) >= config["max_open_trades"]:
+        return False
+
+    if find_trade(
+        t["address"]
+    ):
+        return False
+
+    if is_cooldown(
+        t["address"]
+    ):
+        return False
+
+    if not check_entry(t):
+        return False
+
+    try:
+
+        sol_balance = get_sol_balance()
+
+        available = max(
+            0,
+            sol_balance
+            - MIN_SOL_RESERVE
         )
-    ).upper()
 
-    signature = (
-
-        result.get(
-            "signature"
+        position = (
+            available
+            * config["risk_per_trade"]
         )
 
-        or result.get(
-            "txid"
+        position = min(
+            position,
+            config["max_trade_sol"]
         )
 
-        or ""
-    )
+        if position < config["min_trade_sol"]:
+            return False
 
-    success = (
-
-        status == "SUCCESS"
-
-        or bool(
-            signature
+        lamports = int(
+            position
+            * LAMPORTS_PER_SOL
         )
-    )
 
-    return {
+        print(
+            f"BUY {t['symbol']} "
+            f"{position:.6f} SOL"
+        )
 
-        "success": success,
+        txid, quote = jupiter_swap(
+            SOL_MINT,
+            t["address"],
+            lamports
+        )
 
-        "signature": signature,
+        token_amount = int(
+            quote["outAmount"]
+        )
 
-        "amount_sol":
-            amount_sol,
+        trade = {
 
-        "jupiter":
-            result
-    }
+            "id": str(
+                int(
+                    time.time() * 1000
+                )
+            ),
+
+            "address": t["address"],
+
+            "symbol": t["symbol"],
+
+            "entry_price": t["price"],
+
+            "current_price": t["price"],
+
+            "highest_price": t["price"],
+
+            "position_sol": position,
+
+            "remaining_percent": 1.0,
+
+            "token_amount_raw": token_amount,
+
+            "entry_score": t["score"],
+
+            "entry_pressure": t[
+                "buy_pressure"
+            ],
+
+            "entry_time": now_utc(),
+
+            "buy_tx": txid,
+
+            "locked": False,
+
+            "locked_profit_sol": 0.0,
+
+            "status": "OPEN"
+        }
+
+        state[
+            "open_trades"
+        ].append(
+            trade
+        )
+
+        save_state()
+
+        send_buy(
+            t,
+            position,
+            txid
+        )
+
+        return True
+
+    except Exception as e:
+
+        print(
+            "REAL BUY ERROR:",
+            e
+        )
+
+        send_error(
+            f"BUY {t.get('symbol', '?')}",
+            str(e)
+        )
+
+        return False
 
 
 # ============================================================
@@ -1038,251 +1216,630 @@ def real_buy(
 # ============================================================
 
 def real_sell(
-
-    token_address,
-
-    token_amount
-
+    trade,
+    percent,
+    reason,
+    current_price
 ):
-
-    if not LIVE_TRADING:
-
-        return {
-
-            "success": False,
-
-            "test": True,
-
-            "message":
-                "LIVE_TRADING=false"
-        }
-
-    amount = int(
-        token_amount
-    )
-
-    if amount <= 0:
-
-        raise RuntimeError(
-            "Invalid token amount"
-        )
-
-    order = jupiter_order(
-
-        input_mint=
-            token_address,
-
-        output_mint=
-            "So11111111111111111111111111111111111111112",
-
-        amount=
-            amount
-    )
-
-    transaction = order.get(
-        "transaction"
-    )
-
-    request_id = order.get(
-        "requestId"
-    )
-
-    if not transaction:
-        raise RuntimeError(
-            "Jupiter did not return transaction"
-        )
-
-    if not request_id:
-        raise RuntimeError(
-            "Jupiter did not return requestId"
-        )
-
-    raw_transaction = bytes.fromhex(
-        transaction
-    )
-
-    tx = VersionedTransaction.from_bytes(
-        raw_transaction
-    )
-
-    signed_tx = VersionedTransaction(
-        tx.message,
-        [wallet]
-    )
-
-    signed_hex = bytes(
-        signed_tx
-    ).hex()
-
-    result = jupiter_execute(
-
-        signed_hex,
-
-        request_id
-    )
-
-    status = str(
-        result.get(
-            "status",
-            ""
-        )
-    ).upper()
-
-    signature = (
-
-        result.get(
-            "signature"
-        )
-
-        or result.get(
-            "txid"
-        )
-
-        or ""
-    )
-
-    success = (
-
-        status == "SUCCESS"
-
-        or bool(
-            signature
-        )
-    )
-
-    return {
-
-        "success": success,
-
-        "signature": signature,
-
-        "jupiter":
-            result
-    }
-
-
-# ============================================================
-# TELEGRAM MESSAGES
-# ============================================================
-
-def notify(text):
-
-    chat_id = state.get(
-        "chat_id"
-    )
-
-    if not chat_id:
-        return
 
     try:
 
-        bot.send_message(
-            chat_id,
-            text
+        raw_total = int(
+            trade[
+                "token_amount_raw"
+            ]
         )
+
+        raw_sell = int(
+            raw_total
+            * percent
+        )
+
+        if raw_sell <= 0:
+            return False
+
+        txid, quote = jupiter_swap(
+            trade["address"],
+            SOL_MINT,
+            raw_sell
+        )
+
+        out_lamports = int(
+            quote["outAmount"]
+        )
+
+        out_sol = (
+            out_lamports
+            / LAMPORTS_PER_SOL
+        )
+
+        entry_sol = (
+            trade["position_sol"]
+            * percent
+        )
+
+        pnl = (
+            out_sol
+            - entry_sol
+        )
+
+        if percent >= 0.999:
+
+            trade[
+                "token_amount_raw"
+            ] = 0
+
+            trade[
+                "remaining_percent"
+            ] = 0
+
+            trade[
+                "exit_price"
+            ] = current_price
+
+            trade[
+                "exit_reason"
+            ] = reason
+
+            trade[
+                "sell_tx"
+            ] = txid
+
+            trade[
+                "pnl_sol"
+            ] = pnl
+
+            trade[
+                "return_percent"
+            ] = (
+                pnl / entry_sol * 100
+                if entry_sol > 0
+                else 0
+            )
+
+            trade[
+                "exit_time"
+            ] = now_utc()
+
+            trade[
+                "status"
+            ] = "CLOSED"
+
+            if pnl >= 0:
+
+                state["wins"] += 1
+
+                state[
+                    "consecutive_losses"
+                ] = 0
+
+            else:
+
+                state["losses"] += 1
+
+                state[
+                    "consecutive_losses"
+                ] += 1
+
+                set_cooldown(
+                    trade["address"]
+                )
+
+            state[
+                "total_pnl_sol"
+            ] += pnl
+
+            state[
+                "open_trades"
+            ].remove(
+                trade
+            )
+
+            state[
+                "closed_trades"
+            ].append(
+                trade
+            )
+
+            if (
+                state[
+                    "consecutive_losses"
+                ]
+                >= config[
+                    "max_consecutive_losses"
+                ]
+            ):
+
+                state[
+                    "paused_until"
+                ] = (
+                    time.time()
+                    + config[
+                        "loss_pause_seconds"
+                    ]
+                )
+
+            save_state()
+
+            send_sell(
+                trade,
+                pnl,
+                out_sol,
+                reason,
+                txid
+            )
+
+        else:
+
+            trade[
+                "token_amount_raw"
+            ] = (
+                raw_total
+                - raw_sell
+            )
+
+            trade[
+                "remaining_percent"
+            ] = (
+                trade[
+                    "remaining_percent"
+                ]
+                - percent
+            )
+
+            trade[
+                "locked"
+            ] = True
+
+            trade[
+                "locked_profit_sol"
+            ] += max(
+                0,
+                pnl
+            )
+
+            state[
+                "locked_profit_sol"
+            ] += max(
+                0,
+                pnl
+            )
+
+            save_state()
+
+            send_profit_lock(
+                trade,
+                out_sol,
+                pnl,
+                txid
+            )
+
+        return True
 
     except Exception as e:
 
         print(
-            "TELEGRAM SEND ERROR:",
+            "REAL SELL ERROR:",
             e
         )
 
+        send_error(
+            f"SELL {trade.get('symbol', '?')}",
+            str(e)
+        )
+
+        return False
+
 
 # ============================================================
-# DASHBOARD
+# MANAGE OPEN TRADES
 # ============================================================
 
-def current_equity():
+def manage_trades():
 
-    value = num(
+    for trade in list(
+        state["open_trades"]
+    ):
+
+        try:
+
+            pairs = get_pairs(
+                trade["address"]
+            )
+
+            if not pairs:
+                continue
+
+            pairs.sort(
+                key=lambda p:
+                num(
+                    p.get(
+                        "liquidity",
+                        {}
+                    ).get(
+                        "usd"
+                    )
+                ),
+                reverse=True
+            )
+
+            t = analyze(
+                pairs[0]
+            )
+
+            if not t:
+                continue
+
+            current = num(
+                t["price"]
+            )
+
+            if current <= 0:
+                continue
+
+            trade[
+                "current_price"
+            ] = current
+
+            highest = num(
+                trade[
+                    "highest_price"
+                ]
+            )
+
+            if current > highest:
+
+                trade[
+                    "highest_price"
+                ] = current
+
+                highest = current
+
+            entry = num(
+                trade[
+                    "entry_price"
+                ]
+            )
+
+            if entry <= 0:
+                continue
+
+            change = (
+                current - entry
+            ) / entry
+
+            # ================================================
+            # PROFIT LOCK
+            # ================================================
+
+            if (
+                not trade["locked"]
+                and change
+                >= config[
+                    "profit_lock_trigger"
+                ]
+            ):
+
+                real_sell(
+                    trade,
+                    config[
+                        "profit_lock_percent"
+                    ],
+                    "PROFIT LOCK",
+                    current
+                )
+
+                continue
+
+            # ================================================
+            # STOP LOSS
+            # ================================================
+
+            if not trade["locked"]:
+
+                stop_price = (
+                    entry
+                    * (
+                        1
+                        - config[
+                            "stop_loss"
+                        ]
+                    )
+                )
+
+                if current <= stop_price:
+
+                    real_sell(
+                        trade,
+                        1.0,
+                        "STOP LOSS",
+                        current
+                    )
+
+                    continue
+
+            # ================================================
+            # TAKE PROFIT
+            # ================================================
+
+            if (
+                not trade["locked"]
+                and change
+                >= config[
+                    "take_profit"
+                ]
+            ):
+
+                real_sell(
+                    trade,
+                    1.0,
+                    "TAKE PROFIT",
+                    current
+                )
+
+                continue
+
+            # ================================================
+            # TRAILING
+            # ================================================
+
+            if (
+                trade["locked"]
+                and change
+                >= config[
+                    "trailing_start"
+                ]
+            ):
+
+                trailing_price = (
+                    highest
+                    * (
+                        1
+                        - config[
+                            "trailing_distance"
+                        ]
+                    )
+                )
+
+                if current <= trailing_price:
+
+                    real_sell(
+                        trade,
+                        1.0,
+                        "TRAILING PROFIT",
+                        current
+                    )
+
+                    continue
+
+        except Exception as e:
+
+            print(
+                "MANAGE ERROR:",
+                e
+            )
+
+
+# ============================================================
+# MARKET SCAN
+# ============================================================
+
+def scan_market():
+
+    results = []
+
+    try:
+
+        tokens = (
+            latest_solana_tokens()
+        )
+
+        seen = set()
+
+        for item in tokens[:50]:
+
+            address = item.get(
+                "tokenAddress"
+            )
+
+            if not address:
+                continue
+
+            if address in seen:
+                continue
+
+            seen.add(address)
+
+            pairs = get_pairs(
+                address
+            )
+
+            if not pairs:
+                continue
+
+            pairs.sort(
+                key=lambda p:
+                num(
+                    p.get(
+                        "liquidity",
+                        {}
+                    ).get(
+                        "usd"
+                    )
+                ),
+                reverse=True
+            )
+
+            t = analyze(
+                pairs[0]
+            )
+
+            if t:
+                results.append(t)
+
+            time.sleep(
+                0.1
+            )
+
+        results.sort(
+            key=lambda x:
+            x["score"],
+            reverse=True
+        )
+
         state[
-            "balance"
+            "top_hunts"
+        ] = results[:10]
+
+        state[
+            "last_scan"
+        ] = now_utc()
+
+        save_state()
+
+        return results
+
+    except Exception as e:
+
+        print(
+            "SCAN ERROR:",
+            e
+        )
+
+        return []
+
+
+# ============================================================
+# EQUITY
+# ============================================================
+
+def estimated_equity():
+
+    try:
+
+        balance = get_sol_balance()
+
+    except Exception:
+
+        balance = state[
+            "balance_sol"
+        ]
+
+    return balance
+
+
+def pnl_sol():
+
+    current = estimated_equity()
+
+    start = num(
+        state[
+            "starting_balance_sol"
         ]
     )
 
-    return value
+    if start <= 0:
+        return 0.0
+
+    return current - start
 
 
 def win_rate():
 
     total = (
-
         state["wins"]
-        +
-        state["losses"]
+        + state["losses"]
     )
 
     if total == 0:
         return 0
 
     return (
-
         state["wins"]
         / total
         * 100
     )
 
 
+# ============================================================
+# DASHBOARD
+# ============================================================
+
 def dashboard_text():
 
     try:
 
-        wallet_sol = get_sol_balance()
+        balance = get_sol_balance()
+
+        state[
+            "balance_sol"
+        ] = balance
 
     except Exception:
 
-        wallet_sol = 0
+        balance = state[
+            "balance_sol"
+        ]
 
-    mode = (
+    if (
+        state[
+            "starting_balance_sol"
+        ] <= 0
+    ):
 
-        "🔴 LIVE TRADING"
+        state[
+            "starting_balance_sol"
+        ] = balance
 
-        if LIVE_TRADING
-
-        else
-
-        "🧪 SAFE TEST MODE"
+    pnl = (
+        balance
+        - state[
+            "starting_balance_sol"
+        ]
     )
 
-    status = (
+    if not config["enabled"]:
 
-        "⏸️ PAUSED"
+        status = "⏸️ PAUSED"
 
-        if not state["enabled"]
+    elif time.time() < num(
+        state["paused_until"]
+    ):
 
-        else
+        status = "🟡 LOSS PROTECTION"
 
-        "🟢 ONLINE"
-    )
+    else:
+
+        status = "🟢 LIVE"
 
     return f"""
 <b>🦈 SOLANA HUNTER V6</b>
 
 ━━━━━━━━━━━━━━━━━━━━
 
+🔴 <b>REAL TRADING</b>
+
 🤖 Status:
 <b>{status}</b>
 
-⚡ Mode:
-<b>{mode}</b>
-
-👛 Wallet:
-<code>{WALLET_ADDRESS}</code>
-
-💎 SOL:
-<b>{wallet_sol:.6f}</b>
+💼 Wallet:
+<code>{WALLET}</code>
 
 ━━━━━━━━━━━━━━━━━━━━
 
-💵 Paper Cash:
-<b>${state["balance"]:.4f}</b>
+💰 SOL Balance:
+<b>{balance:.6f} SOL</b>
 
-💰 Total PnL:
-<b>{state["total_pnl"]:+.4f} USD</b>
+📊 PnL:
+<b>{pnl:+.6f} SOL</b>
+
+🔒 Locked Profit:
+<b>{state["locked_profit_sol"]:+.6f} SOL</b>
+
+━━━━━━━━━━━━━━━━━━━━
 
 📂 Open:
-<b>{len(state["open_trades"])}/{MAX_OPEN_TRADES}</b>
+<b>{len(state["open_trades"])}/{config["max_open_trades"]}</b>
 
 🔢 Closed:
 <b>{len(state["closed_trades"])}</b>
@@ -1301,32 +1858,48 @@ def dashboard_text():
 
 ━━━━━━━━━━━━━━━━━━━━
 
-🎯 Take Profit:
-<b>+{TAKE_PROFIT * 100:.1f}%</b>
+⭐ Min Score:
+<b>{config["min_score"]}</b>
 
-🛑 Stop Loss:
-<b>-{STOP_LOSS * 100:.1f}%</b>
+🟢 Buy Pressure:
+<b>{config["min_buy_pressure"]:.0f}%+</b>
+
+💧 Liquidity:
+<b>${config["min_liquidity"]:,.0f}+</b>
+
+📊 M5 Volume:
+<b>${config["min_m5_volume"]:,.0f}+</b>
+
+━━━━━━━━━━━━━━━━━━━━
+
+🎯 TP:
+<b>+{config["take_profit"] * 100:.0f}%</b>
+
+🛑 SL:
+<b>-{config["stop_loss"] * 100:.0f}%</b>
+
+🔒 Lock:
+<b>+{config["profit_lock_trigger"] * 100:.0f}%</b>
 
 📈 Trailing:
-<b>+{TRAILING_START * 100:.1f}% / -{TRAILING_DISTANCE * 100:.1f}%</b>
+<b>{config["trailing_distance"] * 100:.0f}%</b>
 
-💸 Max Trade:
-<b>{MAX_TRADE_SOL:.4f} SOL</b>
+🛡️ Risk:
+<b>{config["risk_per_trade"] * 100:.0f}%</b>
 
-📂 Max Open:
-<b>{MAX_OPEN_TRADES}</b>
-
-⭐ Min Score:
-<b>{MIN_SCORE}</b>
+⛽ Slippage:
+<b>{config["slippage_bps"] / 100:.2f}%</b>
 
 ━━━━━━━━━━━━━━━━━━━━
 
 🕐 Last Scan:
 {state["last_scan"] or "-"}
-
-━━━━━━━━━━━━━━━━━━━━
 """
 
+
+# ============================================================
+# DASHBOARD SEND
+# ============================================================
 
 def send_dashboard(chat_id):
 
@@ -1335,11 +1908,8 @@ def send_dashboard(chat_id):
     ] = chat_id
 
     msg = bot.send_message(
-
         chat_id,
-
         dashboard_text(),
-
         reply_markup=main_menu()
     )
 
@@ -1366,11 +1936,8 @@ def update_dashboard():
     try:
 
         bot.edit_message_text(
-
             dashboard_text(),
-
             chat_id,
-
             message_id
         )
 
@@ -1380,90 +1947,132 @@ def update_dashboard():
 
 
 # ============================================================
-# BUY LOG
+# TELEGRAM ALERTS
 # ============================================================
 
-def notify_buy(
-
-    token,
-
-    result
-
+def send_buy(
+    t,
+    position,
+    txid
 ):
 
-    if result.get(
-        "test"
-    ):
-
-        notify(
-            f"""
-<b>🧪 V6 BUY TEST</b>
-
-🪙 {token["symbol"]}
-
-⭐ Score:
-<b>{token["score"]}/100</b>
-
-💰 Planned:
-<b>{MAX_TRADE_SOL:.4f} SOL</b>
-
-⚠️ LIVE_TRADING=false
-
-هیچ معامله واقعی انجام نشد.
-"""
-        )
-
-        return
-
-    signature = result.get(
-        "signature",
-        "-"
+    chat_id = state.get(
+        "chat_id"
     )
 
-    notify(
+    if not chat_id:
+        return
+
+    bot.send_message(
+        chat_id,
+
         f"""
 <b>🟢 REAL BUY V6</b>
 
-🪙 <b>{token["symbol"]}</b>
+🪙 <b>{t["symbol"]}</b>
 
 ⭐ Score:
-<b>{token["score"]}/100</b>
+<b>{t["score"]}/100</b>
 
-💰 Amount:
-<b>{result.get("amount_sol", 0):.6f} SOL</b>
+💵 Price:
+${t["price"]:.10f}
 
-🔗 Signature:
-<code>{signature}</code>
+💧 Liquidity:
+${t["liquidity"]:,.0f}
+
+🟢 Buy Pressure:
+{t["buy_pressure"]:.1f}%
+
+📈 M5:
+{t["m5"]:+.2f}%
+
+💰 Position:
+<b>{position:.6f} SOL</b>
+
+🛡️ Risk:
+{config["risk_per_trade"] * 100:.0f}%
+
+🔗 TX:
+<code>{txid}</code>
 
 🕐 {now_utc()}
 """
     )
 
 
-# ============================================================
-# SELL LOG
-# ============================================================
-
-def notify_sell(
-
+def send_profit_lock(
     trade,
-
-    result,
-
-    reason
-
+    out_sol,
+    pnl,
+    txid
 ):
 
-    signature = result.get(
-        "signature",
-        "-"
+    chat_id = state.get(
+        "chat_id"
     )
 
-    notify(
+    if not chat_id:
+        return
+
+    bot.send_message(
+        chat_id,
+
         f"""
-<b>🔴 REAL SELL V6</b>
+<b>🔒 PROFIT LOCK V6</b>
 
 🪙 <b>{trade["symbol"]}</b>
+
+💰 Received:
+<b>+{out_sol:.6f} SOL</b>
+
+📈 Locked PnL:
+<b>{pnl:+.6f} SOL</b>
+
+📂 Remaining:
+<b>{trade["remaining_percent"] * 100:.0f}%</b>
+
+🔗 TX:
+<code>{txid}</code>
+
+🕐 {now_utc()}
+"""
+    )
+
+
+def send_sell(
+    trade,
+    pnl,
+    out_sol,
+    reason,
+    txid
+):
+
+    chat_id = state.get(
+        "chat_id"
+    )
+
+    if not chat_id:
+        return
+
+    emoji = (
+        "🟢"
+        if pnl >= 0
+        else "🔴"
+    )
+
+    bot.send_message(
+        chat_id,
+
+        f"""
+<b>{emoji} REAL SELL V6</b>
+
+🪙 <b>{trade["symbol"]}</b>
+
+💰 Received:
+<b>{out_sol:.6f} SOL</b>
+
+📊 PnL:
+<b>{pnl:+.6f} SOL</b>
 
 🎯 Reason:
 <b>{reason}</b>
@@ -1471,558 +2080,39 @@ def notify_sell(
 📈 Return:
 <b>{trade.get("return_percent", 0):+.2f}%</b>
 
-💰 PnL:
-<b>{trade.get("pnl", 0):+.6f}</b>
-
-🔗 Signature:
-<code>{signature}</code>
+🔗 TX:
+<code>{txid}</code>
 
 🕐 {now_utc()}
 """
     )
 
 
-# ============================================================
-# BUY
-# ============================================================
-
-def execute_buy(token):
-
-    if not state["enabled"]:
-        return False
-
-    if time.time() < num(
-        state["paused_until"]
-    ):
-        return False
-
-    if len(
-        state["open_trades"]
-    ) >= MAX_OPEN_TRADES:
-        return False
-
-    if find_trade(
-        token["address"]
-    ):
-        return False
-
-    if is_cooldown(
-        token["address"]
-    ):
-        return False
-
-    if not check_entry(
-        token
-    ):
-        return False
-
-    result = real_buy(
-
-        token["address"],
-
-        token["symbol"]
-    )
-
-    if LIVE_TRADING and not result.get(
-        "success"
-    ):
-
-        notify(
-            f"""
-❌ <b>BUY FAILED</b>
-
-🪙 {token["symbol"]}
-
-Jupiter معامله را تأیید نکرد.
-"""
-        )
-
-        return False
-
-    trade = {
-
-        "id": str(
-            int(
-                time.time()
-                * 1000
-            )
-        ),
-
-        "address":
-            token["address"],
-
-        "symbol":
-            token["symbol"],
-
-        "entry_price":
-            token["price"],
-
-        "current_price":
-            token["price"],
-
-        "highest_price":
-            token["price"],
-
-        "amount_sol":
-            result.get(
-                "amount_sol",
-                MAX_TRADE_SOL
-            ),
-
-        "entry_time":
-            now_utc(),
-
-        "entry_score":
-            token["score"],
-
-        "status":
-            "OPEN",
-
-        "buy_signature":
-            result.get(
-                "signature",
-                ""
-            )
-    }
-
-    state[
-        "open_trades"
-    ].append(
-        trade
-    )
-
-    save_state()
-
-    notify_buy(
-        token,
-        result
-    )
-
-    return True
-
-
-# ============================================================
-# SELL
-# ============================================================
-
-def close_trade(
-
-    trade,
-
-    current_price,
-
-    reason
-
+def send_error(
+    title,
+    error
 ):
 
-    entry = num(
-        trade[
-            "entry_price"
-        ]
+    chat_id = state.get(
+        "chat_id"
     )
 
-    if entry <= 0:
+    if not chat_id:
         return
 
-    change = (
+    bot.send_message(
+        chat_id,
 
-        current_price
-        - entry
-    ) / entry
+        f"""
+<b>⚠️ V6 ERROR</b>
 
-    trade[
-        "return_percent"
-    ] = change * 100
+<b>{title}</b>
 
-    trade[
-        "pnl"
-    ] = (
-        trade[
-            "amount_sol"
-        ]
-        * change
-    )
+<code>{str(error)[:2500]}</code>
 
-    # V6 requires the actual token amount
-    # to be known before a real sell.
-    #
-    # The amount is obtained from the wallet
-    # token account in the next production step.
-    #
-    # Therefore we do NOT invent a token amount.
-
-    if LIVE_TRADING:
-
-        notify(
-            f"""
-⚠️ <b>SELL SAFETY STOP</b>
-
-🪙 {trade["symbol"]}
-
-🎯 Signal:
-<b>{reason}</b>
-
-📈 Change:
-<b>{change * 100:+.2f}%</b>
-
-ربات از فروش با مقدار حدسی جلوگیری کرد.
-مقدار واقعی توکن باید از موجودی کیف پول خوانده شود.
+🕐 {now_utc()}
 """
-        )
-
-        return
-
-    state[
-        "balance"
-    ] += (
-        trade["amount_sol"]
-        + trade["pnl"]
     )
-
-    state[
-        "total_pnl"
-    ] += trade["pnl"]
-
-    if trade["pnl"] >= 0:
-
-        state["wins"] += 1
-
-        state[
-            "consecutive_losses"
-        ] = 0
-
-    else:
-
-        state["losses"] += 1
-
-        state[
-            "consecutive_losses"
-        ] += 1
-
-        set_cooldown(
-            trade["address"]
-        )
-
-    trade[
-        "exit_price"
-    ] = current_price
-
-    trade[
-        "exit_reason"
-    ] = reason
-
-    trade[
-        "exit_time"
-    ] = now_utc()
-
-    trade[
-        "status"
-    ] = "CLOSED"
-
-    state[
-        "open_trades"
-    ].remove(
-        trade
-    )
-
-    state[
-        "closed_trades"
-    ].append(
-        trade
-    )
-
-    save_state()
-
-
-# ============================================================
-# MANAGE TRADES
-# ============================================================
-
-def manage_trades():
-
-    for trade in list(
-        state[
-            "open_trades"
-        ]
-    ):
-
-        try:
-
-            pairs = get_pairs(
-                trade[
-                    "address"
-                ]
-            )
-
-            if not pairs:
-                continue
-
-            pairs.sort(
-
-                key=lambda p:
-                num(
-                    p.get(
-                        "liquidity",
-                        {}
-                    ).get(
-                        "usd"
-                    )
-                ),
-
-                reverse=True
-            )
-
-            token = analyze(
-                pairs[0]
-            )
-
-            if not token:
-                continue
-
-            current = num(
-                token["price"]
-            )
-
-            if current <= 0:
-                continue
-
-            trade[
-                "current_price"
-            ] = current
-
-            highest = num(
-                trade.get(
-                    "highest_price",
-                    trade["entry_price"]
-                )
-            )
-
-            if current > highest:
-
-                trade[
-                    "highest_price"
-                ] = current
-
-                highest = current
-
-            entry = num(
-                trade[
-                    "entry_price"
-                ]
-            )
-
-            change = (
-
-                current
-                - entry
-            ) / entry
-
-            # STOP LOSS
-
-            if change <= -STOP_LOSS:
-
-                close_trade(
-
-                    trade,
-
-                    current,
-
-                    "STOP LOSS"
-                )
-
-                continue
-
-            # TAKE PROFIT
-
-            if change >= TAKE_PROFIT:
-
-                close_trade(
-
-                    trade,
-
-                    current,
-
-                    "TAKE PROFIT"
-                )
-
-                continue
-
-            # TRAILING
-
-            if change >= TRAILING_START:
-
-                trailing_price = (
-
-                    highest
-                    * (
-                        1
-                        - TRAILING_DISTANCE
-                    )
-                )
-
-                if current <= trailing_price:
-
-                    close_trade(
-
-                        trade,
-
-                        current,
-
-                        "TRAILING STOP"
-                    )
-
-                    continue
-
-        except Exception as e:
-
-            print(
-                "MANAGE ERROR:",
-                e
-            )
-
-
-# ============================================================
-# SCAN
-# ============================================================
-
-def scan_market():
-
-    results = []
-
-    tokens = latest_solana_tokens()
-
-    seen = set()
-
-    for item in tokens[:60]:
-
-        address = item.get(
-            "tokenAddress"
-        )
-
-        if not address:
-            continue
-
-        if address in seen:
-            continue
-
-        seen.add(
-            address
-        )
-
-        pairs = get_pairs(
-            address
-        )
-
-        if not pairs:
-            continue
-
-        pairs.sort(
-
-            key=lambda p:
-            num(
-                p.get(
-                    "liquidity",
-                    {}
-                ).get(
-                    "usd"
-                )
-            ),
-
-            reverse=True
-        )
-
-        token = analyze(
-            pairs[0]
-        )
-
-        if token:
-
-            results.append(
-                token
-            )
-
-        time.sleep(
-            0.1
-        )
-
-    results.sort(
-
-        key=lambda x:
-        x["score"],
-
-        reverse=True
-    )
-
-    state[
-        "top_hunts"
-    ] = results[:10]
-
-    state[
-        "last_scan"
-    ] = now_utc()
-
-    save_state()
-
-    return results
-
-
-# ============================================================
-# ENGINE
-# ============================================================
-
-def trading_engine():
-
-    print(
-        "🦈 V6 ENGINE STARTED"
-    )
-
-    print(
-        "Wallet:",
-        WALLET_ADDRESS
-    )
-
-    print(
-        "LIVE_TRADING:",
-        LIVE_TRADING
-    )
-
-    while True:
-
-        try:
-
-            manage_trades()
-
-            results = scan_market()
-
-            if state["enabled"]:
-
-                if time.time() >= num(
-                    state["paused_until"]
-                ):
-
-                    for token in results:
-
-                        if execute_buy(
-                            token
-                        ):
-
-                            break
-
-            update_dashboard()
-
-        except Exception as e:
-
-            print(
-                "ENGINE ERROR:",
-                e
-            )
-
-        time.sleep(
-            max(
-                10,
-                SCAN_SECONDS
-            )
-        )
 
 
 # ============================================================
@@ -2038,11 +2128,8 @@ def send_top(chat_id):
     if not hunts:
 
         bot.send_message(
-
             chat_id,
-
-            "🔎 هنوز شکار پیدا نشده.",
-
+            "🔎 هنوز شکار جدیدی پیدا نشده.",
             reply_markup=main_menu()
         )
 
@@ -2062,55 +2149,37 @@ def send_top(chat_id):
         )
 
         signal = (
-
-            "🟢 BUY CANDIDATE"
-
+            "🟢 BUY"
             if valid
-
-            else
-
-            "⚪ FILTERED"
+            else "⚪ FILTERED"
         )
 
         text += f"""
 <b>#{i} 🪙 {t["symbol"]}</b>
 
-⭐ Score:
-<b>{t["score"]}/100</b>
+⭐ Score: {t["score"]}/100
+💵 ${t["price"]:.10f}
 
-💵 Price:
-${t["price"]:.10f}
+💧 ${t["liquidity"]:,.0f}
+📊 M5: ${t["volume"]:,.2f}
 
-💧 Liquidity:
-${t["liquidity"]:,.0f}
+🛒 Buys: {t["buys"]}
+📉 Sells: {t["sells"]}
 
-📊 M5 Volume:
-${t["volume"]:,.2f}
-
-🛒 Buys:
-{t["buys"]}
-
-📉 Sells:
-{t["sells"]}
-
-🟢 Buy Pressure:
+🟢 Pressure:
 {t["buy_pressure"]:.1f}%
 
 📈 M5:
 {t["m5"]:+.2f}%
 
-🚦 Signal:
-<b>{signal}</b>
+🚦 <b>{signal}</b>
 
 ━━━━━━━━━━━━━━━━━━━━
 """
 
     bot.send_message(
-
         chat_id,
-
         text,
-
         reply_markup=main_menu()
     )
 
@@ -2128,18 +2197,15 @@ def send_open(chat_id):
     if not trades:
 
         bot.send_message(
-
             chat_id,
-
-            "📂 معامله بازی نداریم.",
-
+            "📂 هیچ معامله بازی نداریم.",
             reply_markup=main_menu()
         )
 
         return
 
     text = (
-        "<b>📂 OPEN TRADES V6</b>\n\n"
+        "<b>📂 OPEN REAL TRADES</b>\n\n"
     )
 
     for trade in trades:
@@ -2151,20 +2217,27 @@ def send_open(chat_id):
         )
 
         current = num(
-            trade.get(
-                "current_price",
-                entry
-            )
+            trade[
+                "current_price"
+            ]
         )
 
-        pct = (
+        pct = 0
 
-            (
-                current
-                - entry
-            )
-            / entry
-            * 100
+        if entry > 0:
+
+            pct = (
+                (
+                    current
+                    - entry
+                )
+                / entry
+            ) * 100
+
+        locked = (
+            "🔒 YES"
+            if trade["locked"]
+            else "⏳ NO"
         )
 
         text += f"""
@@ -2179,21 +2252,18 @@ ${current:.10f}
 📊 Return:
 <b>{pct:+.2f}%</b>
 
-💰 Amount:
-<b>{trade["amount_sol"]:.6f} SOL</b>
+💰 Position:
+{trade["position_sol"]:.6f} SOL
 
-🔗 Buy:
-<code>{trade.get("buy_signature", "-")}</code>
+🔒 Lock:
+<b>{locked}</b>
 
 ━━━━━━━━━━━━━━━━━━━━
 """
 
     bot.send_message(
-
         chat_id,
-
         text,
-
         reply_markup=main_menu()
     )
 
@@ -2211,39 +2281,42 @@ def send_history(chat_id):
     if not trades:
 
         bot.send_message(
-
             chat_id,
-
             "📜 هنوز معامله‌ای بسته نشده.",
-
             reply_markup=main_menu()
         )
 
         return
 
     text = (
-        "<b>📜 HISTORY V6</b>\n\n"
+        "<b>📜 REAL TRADE HISTORY</b>\n\n"
     )
 
     for trade in trades[-15:]:
 
         pnl = num(
             trade.get(
-                "pnl"
+                "pnl_sol",
+                0
             )
         )
 
+        emoji = (
+            "🟢"
+            if pnl >= 0
+            else "🔴"
+        )
+
         text += f"""
-🪙 <b>{trade["symbol"]}</b>
+{emoji} <b>{trade["symbol"]}</b>
 
 💰 PnL:
-<b>{pnl:+.6f}</b>
+<b>{pnl:+.6f} SOL</b>
 
 📊 Return:
-<b>{trade.get("return_percent", 0):+.2f}%</b>
+{num(trade.get("return_percent")):+.2f}%
 
-🎯 Reason:
-{trade.get("exit_reason", "-")}
+🎯 {trade.get("exit_reason", "-")}
 
 🕐 {trade.get("exit_time", "-")}
 
@@ -2251,12 +2324,341 @@ def send_history(chat_id):
 """
 
     bot.send_message(
-
         chat_id,
-
         text,
-
         reply_markup=main_menu()
+    )
+
+
+# ============================================================
+# SETTINGS CALLBACK
+# ============================================================
+
+@bot.callback_query_handler(
+    func=lambda call:
+    call.data.startswith("set_")
+    or call.data == "reset_config"
+)
+def settings_callback(call):
+
+    chat_id = call.message.chat.id
+
+    data = call.data
+
+    if data == "reset_config":
+
+        config.clear()
+
+        config.update(
+            DEFAULT_CONFIG
+        )
+
+        save_config()
+
+        bot.answer_callback_query(
+            call.id,
+            "تنظیمات ریست شد."
+        )
+
+        bot.send_message(
+            chat_id,
+            settings_text(),
+            reply_markup=settings_menu()
+        )
+
+        return
+
+    prompts = {
+
+        "set_score":
+            "⭐ حداقل Score؟",
+
+        "set_pressure":
+            "🟢 حداقل Buy Pressure؟",
+
+        "set_liquidity":
+            "💧 حداقل Liquidity به دلار؟",
+
+        "set_volume":
+            "📊 حداقل M5 Volume؟",
+
+        "set_tp":
+            "🎯 Take Profit به درصد؟",
+
+        "set_sl":
+            "🛑 Stop Loss به درصد؟",
+
+        "set_profit_lock":
+            "🔒 Profit Lock به درصد؟",
+
+        "set_trailing":
+            "📈 Trailing Distance به درصد؟",
+
+        "set_risk":
+            "🛡️ Risk هر معامله به درصد؟",
+
+        "set_max_trades":
+            "📂 حداکثر معاملات باز؟",
+
+        "set_slippage":
+            "⛽ Slippage به درصد؟ مثلاً 1",
+
+        "set_scan":
+            "⏱️ Scan چند ثانیه؟",
+
+        "set_cooldown":
+            "🚫 Cooldown چند ثانیه؟"
+    }
+
+    state[
+        "waiting_setting"
+    ] = data
+
+    save_state()
+
+    bot.answer_callback_query(
+        call.id
+    )
+
+    bot.send_message(
+        chat_id,
+        prompts.get(
+            data,
+            "عدد جدید را بفرست."
+        ),
+        reply_markup=main_menu()
+    )
+
+
+# ============================================================
+# SETTING VALUE
+# ============================================================
+
+@bot.message_handler(
+    func=lambda message:
+    state.get(
+        "waiting_setting"
+    ) is not None
+)
+def setting_value(message):
+
+    key = state.get(
+        "waiting_setting"
+    )
+
+    raw = (
+        message.text or ""
+    ).strip()
+
+    try:
+
+        value = float(
+            raw.replace(
+                "%",
+                ""
+            )
+        )
+
+        if key == "set_score":
+
+            config[
+                "min_score"
+            ] = int(
+                max(
+                    0,
+                    min(
+                        100,
+                        value
+                    )
+                )
+            )
+
+        elif key == "set_pressure":
+
+            config[
+                "min_buy_pressure"
+            ] = max(
+                0,
+                min(
+                    100,
+                    value
+                )
+            )
+
+        elif key == "set_liquidity":
+
+            config[
+                "min_liquidity"
+            ] = max(
+                0,
+                value
+            )
+
+        elif key == "set_volume":
+
+            config[
+                "min_m5_volume"
+            ] = max(
+                0,
+                value
+            )
+
+        elif key == "set_tp":
+
+            config[
+                "take_profit"
+            ] = max(
+                0.01,
+                min(
+                    1,
+                    value / 100
+                )
+            )
+
+        elif key == "set_sl":
+
+            config[
+                "stop_loss"
+            ] = max(
+                0.01,
+                min(
+                    0.5,
+                    value / 100
+                )
+            )
+
+        elif key == "set_profit_lock":
+
+            config[
+                "profit_lock_trigger"
+            ] = max(
+                0.01,
+                min(
+                    1,
+                    value / 100
+                )
+            )
+
+        elif key == "set_trailing":
+
+            config[
+                "trailing_distance"
+            ] = max(
+                0.01,
+                min(
+                    0.5,
+                    value / 100
+                )
+            )
+
+        elif key == "set_risk":
+
+            config[
+                "risk_per_trade"
+            ] = max(
+                0.01,
+                min(
+                    0.25,
+                    value / 100
+                )
+            )
+
+        elif key == "set_max_trades":
+
+            config[
+                "max_open_trades"
+            ] = int(
+                max(
+                    1,
+                    min(
+                        10,
+                        value
+                    )
+                )
+            )
+
+        elif key == "set_slippage":
+
+            config[
+                "slippage_bps"
+            ] = int(
+                max(
+                    10,
+                    min(
+                        500,
+                        value * 100
+                    )
+                )
+            )
+
+        elif key == "set_scan":
+
+            config[
+                "scan_seconds"
+            ] = int(
+                max(
+                    10,
+                    min(
+                        300,
+                        value
+                    )
+                )
+            )
+
+        elif key == "set_cooldown":
+
+            config[
+                "cooldown_seconds"
+            ] = int(
+                max(
+                    0,
+                    min(
+                        86400,
+                        value
+                    )
+                )
+            )
+
+        else:
+
+            raise ValueError(
+                "Unknown setting"
+            )
+
+        state[
+            "waiting_setting"
+        ] = None
+
+        save_config()
+        save_state()
+
+        bot.send_message(
+            message.chat.id,
+            "✅ تنظیم ذخیره شد.",
+            reply_markup=main_menu()
+        )
+
+        send_settings(
+            message.chat.id
+        )
+
+    except Exception:
+
+        bot.send_message(
+            message.chat.id,
+
+            "❌ مقدار نامعتبر. فقط عدد بفرست.",
+
+            reply_markup=main_menu()
+        )
+
+
+def send_settings(chat_id):
+
+    bot.send_message(
+        chat_id,
+        settings_text(),
+        reply_markup=settings_menu()
     )
 
 
@@ -2267,7 +2669,7 @@ def send_history(chat_id):
 @bot.message_handler(
     commands=["start"]
 )
-def start(message):
+def command_start(message):
 
     state[
         "chat_id"
@@ -2276,25 +2678,26 @@ def start(message):
     save_state()
 
     bot.send_message(
-
         message.chat.id,
 
         f"""
 <b>🦈 SOLANA HUNTER V6</b>
 
-🤖 ربات متصل شد.
+🟢 <b>REAL TRADING ENABLED</b>
 
-⚡ Mode:
-<b>{"LIVE TRADING" if LIVE_TRADING else "SAFE TEST MODE"}</b>
+⚡ Jupiter V6
+💰 Real Buy / Sell
+🛡️ Risk Management
+🎯 TP / SL
+🔒 Profit Lock
+📈 Trailing
+🚫 Cooldown
+📊 Telegram Dashboard
 
-👛 Wallet:
-<code>{WALLET_ADDRESS}</code>
+💼 Wallet:
+<code>{WALLET}</code>
 
-💎 SOL:
-<b>{get_sol_balance():.6f}</b>
-
-🛡️ Max Trade:
-<b>{MAX_TRADE_SOL:.4f} SOL</b>
+⚠️ معاملات با پول واقعی انجام می‌شوند.
 """,
 
         reply_markup=main_menu()
@@ -2312,7 +2715,7 @@ def start(message):
 @bot.message_handler(
     commands=["dashboard"]
 )
-def dashboard(message):
+def command_dashboard(message):
 
     state[
         "chat_id"
@@ -2328,7 +2731,7 @@ def dashboard(message):
 @bot.message_handler(
     commands=["top"]
 )
-def top(message):
+def command_top(message):
 
     send_top(
         message.chat.id
@@ -2338,7 +2741,7 @@ def top(message):
 @bot.message_handler(
     commands=["open"]
 )
-def opened(message):
+def command_open(message):
 
     send_open(
         message.chat.id
@@ -2348,7 +2751,7 @@ def opened(message):
 @bot.message_handler(
     commands=["history"]
 )
-def history(message):
+def command_history(message):
 
     send_history(
         message.chat.id
@@ -2356,56 +2759,26 @@ def history(message):
 
 
 @bot.message_handler(
-    commands=["wallet"]
+    commands=["settings"]
 )
-def wallet_command(message):
+def command_settings(message):
 
-    try:
-
-        balance = get_sol_balance()
-
-        bot.send_message(
-
-            message.chat.id,
-
-            f"""
-<b>👛 WALLET</b>
-
-Address:
-<code>{WALLET_ADDRESS}</code>
-
-💎 SOL:
-<b>{balance:.6f}</b>
-
-⚡ Mode:
-<b>{"LIVE" if LIVE_TRADING else "TEST"}</b>
-""",
-
-            reply_markup=main_menu()
-        )
-
-    except Exception as e:
-
-        bot.send_message(
-
-            message.chat.id,
-
-            f"❌ Wallet RPC error:\n<code>{e}</code>"
-        )
+    send_settings(
+        message.chat.id
+    )
 
 
 # ============================================================
-# MENU
+# BOTTOM MENU
 # ============================================================
 
 @bot.message_handler(
     func=lambda message: True
 )
-def menu(message):
+def menu_handler(message):
 
     text = (
-        message.text
-        or ""
+        message.text or ""
     )
 
     state[
@@ -2438,45 +2811,101 @@ def menu(message):
             message.chat.id
         )
 
-    elif text == "💰 کیف پول":
+    elif text == "⚙️ تنظیمات":
 
-        wallet_command(
-            message
+        send_settings(
+            message.chat.id
         )
 
     elif text == "⏸️ توقف / ▶️ ادامه":
 
-        state[
+        config[
             "enabled"
-        ] = not state[
+        ] = not config[
             "enabled"
         ]
 
-        save_state()
+        save_config()
+
+        status = (
+            "🟢 ربات فعال شد."
+            if config["enabled"]
+            else "⏸️ ربات متوقف شد."
+        )
 
         bot.send_message(
-
             message.chat.id,
-
-            (
-                "🟢 ربات فعال شد."
-                if state["enabled"]
-                else
-                "⏸️ ربات متوقف شد."
-            ),
-
+            status,
             reply_markup=main_menu()
         )
 
     elif text == "ℹ️ وضعیت":
 
         bot.send_message(
-
             message.chat.id,
-
             dashboard_text(),
-
             reply_markup=main_menu()
+        )
+
+
+# ============================================================
+# TRADING ENGINE
+# ============================================================
+
+def trading_engine():
+
+    print(
+        "🦈 SOLANA HUNTER V6 STARTED"
+    )
+
+    while True:
+
+        try:
+
+            update_balance()
+
+            manage_trades()
+
+            results = scan_market()
+
+            if (
+                config["enabled"]
+                and time.time()
+                >= num(
+                    state["paused_until"]
+                )
+            ):
+
+                for token in results:
+
+                    if real_buy(
+                        token
+                    ):
+                        break
+
+            update_dashboard()
+
+        except Exception as e:
+
+            print(
+                "ENGINE ERROR:",
+                e
+            )
+
+            send_error(
+                "ENGINE",
+                str(e)
+            )
+
+        time.sleep(
+            max(
+                10,
+                int(
+                    config[
+                        "scan_seconds"
+                    ]
+                )
+            )
         )
 
 
@@ -2486,60 +2915,54 @@ def menu(message):
 
 def main():
 
+    print(
+        """
+============================================================
+🦈 SOLANA HUNTER V6
+============================================================
+
+🔴 REAL TRADING: ENABLED
+⚡ Jupiter V6
+💰 REAL BUY / SELL
+🛡️ RISK MANAGEMENT
+🎯 TP / SL
+🔒 PROFIT LOCK
+📈 TRAILING
+🚫 COOLDOWN
+📊 TELEGRAM DASHBOARD
+
+Wallet:
+""" + WALLET + """
+
+============================================================
+"""
+    )
+
+    load_config()
+
     load_state()
-
-    print(
-        "=================================================="
-    )
-
-    print(
-        "🦈 SOLANA HUNTER V6"
-    )
-
-    print(
-        "Wallet:",
-        WALLET_ADDRESS
-    )
-
-    print(
-        "LIVE_TRADING:",
-        LIVE_TRADING
-    )
-
-    print(
-        "RPC:",
-        RPC_URL
-    )
-
-    print(
-        "=================================================="
-    )
-
-    # Wallet/RPC connectivity test
 
     try:
 
-        balance = get_sol_balance()
-
-        print(
-            f"💎 Wallet SOL: {balance:.6f}"
-        )
+        update_balance()
 
     except Exception as e:
 
         print(
-            "❌ RPC ERROR:",
+            "INITIAL BALANCE ERROR:",
             e
         )
 
     engine = threading.Thread(
-
         target=trading_engine,
-
         daemon=True
     )
 
     engine.start()
+
+    print(
+        "🟢 TRADING ENGINE STARTED"
+    )
 
     while True:
 
@@ -2548,11 +2971,8 @@ def main():
             bot.remove_webhook()
 
             bot.infinity_polling(
-
                 timeout=30,
-
                 long_polling_timeout=30,
-
                 skip_pending=True
             )
 
@@ -2563,9 +2983,7 @@ def main():
                 e
             )
 
-            time.sleep(
-                10
-            )
+            time.sleep(10)
 
 
 # ============================================================
